@@ -45,28 +45,39 @@ class StatusBarController {
 
   private func updateIcon() {
     guard let button = statusItem.button else { return }
-    let symbol: String
     let color: NSColor
 
     switch currentStatus {
     case .idle:
-      symbol = "circle.fill"; color = .systemGreen
+      color = .systemGreen
     case .loading, .sending:
-      symbol = "arrow.triangle.2.circlepath"; color = .systemBlue
+      color = .systemBlue
     case .listening:
-      symbol = "mic.fill"; color = .systemRed
+      color = .systemRed
     case .error:
-      symbol = "exclamationmark.triangle.fill"; color = .systemYellow
+      color = .systemYellow
     case .offline:
-      symbol = "circle.dashed"; color = .systemGray
+      color = .systemGray
     }
 
-    let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
-    if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
-      img.withSymbolConfiguration(config)
-      button.image = img
-      button.contentTintColor = color
-    }
+    let size = NSSize(width: 18, height: 18)
+    let img = NSImage(size: size)
+    img.lockFocus()
+    
+    let dotSize: CGFloat = 8
+    let rect = NSRect(
+      x: (size.width - dotSize) / 2,
+      y: (size.height - dotSize) / 2,
+      width: dotSize,
+      height: dotSize
+    )
+    
+    color.set()
+    let path = NSBezierPath(ovalIn: rect)
+    path.fill()
+    
+    img.unlockFocus()
+    button.image = img
   }
 
   private func startAnimation() {
@@ -88,24 +99,46 @@ class StatusBarController {
 
   private func buildMenu() {
     let menu = NSMenu()
+    menu.autoenablesItems = false
 
-    let statusItem_ = NSMenuItem(title: "OpenCodex", action: nil, keyEquivalent: "")
-    statusItem_.isEnabled = false
-    menu.addItem(statusItem_)
+    let titleItem = NSMenuItem(title: "OpenCodex", action: nil, keyEquivalent: "")
+    titleItem.isEnabled = false
+    menu.addItem(titleItem)
 
     menu.addItem(NSMenuItem.separator())
 
-    menu.addItem(NSMenuItem(title: "Open Dashboard", action: #selector(openDashboard), keyEquivalent: "d"))
-    menu.addItem(NSMenuItem(title: "Toggle Voice (⌥Space)", action: nil, keyEquivalent: ""))
+    let dashItem = NSMenuItem(title: "Open Dashboard", action: #selector(openDashboard), keyEquivalent: "d")
+    dashItem.target = self
+    menu.addItem(dashItem)
+
+    let newChatItem = NSMenuItem(title: "New Conversation (⌥N)", action: #selector(startNewConversation), keyEquivalent: "n")
+    newChatItem.keyEquivalentModifierMask = [.option]
+    newChatItem.target = self
+    menu.addItem(newChatItem)
+
+    let voiceItem = NSMenuItem(title: "Toggle Voice (⌥Space)", action: nil, keyEquivalent: "")
+    voiceItem.isEnabled = false
+    menu.addItem(voiceItem)
+
     menu.addItem(NSMenuItem.separator())
-    menu.addItem(NSMenuItem(title: "Restart Codex", action: #selector(restartCodex), keyEquivalent: "r"))
-    menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
+
+    let restartItem = NSMenuItem(title: "Restart Codex", action: #selector(restartCodex), keyEquivalent: "r")
+    restartItem.target = self
+    menu.addItem(restartItem)
+
+    let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
+    quitItem.target = self
+    menu.addItem(quitItem)
 
     statusItem.menu = menu
   }
 
   @objc private func openDashboard() {
     NSWorkspace.shared.open(URL(string: "http://localhost:8765/dashboard")!)
+  }
+
+  @objc private func startNewConversation() {
+    AppDelegate.shared?.startNewConversation()
   }
 
   @objc private func restartCodex() {
