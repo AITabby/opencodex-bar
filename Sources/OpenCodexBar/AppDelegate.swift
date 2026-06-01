@@ -284,23 +284,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private func tts(_ t: String) {
     let lines = t.components(separatedBy: "\n")
     var combinedText = ""
+    var lineCount = 0
+    
     for line in lines {
       let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
       if trimmedLine.isEmpty {
-        if !combinedText.isEmpty { break }
         continue
       }
-      // Stop if we encounter details (lists/markdown headers) to avoid reading log files or command steps
-      if trimmedLine.hasPrefix("1.") || trimmedLine.hasPrefix("-") || trimmedLine.hasPrefix("*") || trimmedLine.hasPrefix("#") {
-        if !combinedText.isEmpty { break }
+      
+      // Stop reading if we hit code blocks or terminal commands
+      if trimmedLine.hasPrefix("```") || trimmedLine.hasPrefix("$ ") || trimmedLine.hasPrefix("npm ") || trimmedLine.hasPrefix("node ") {
+        break
+      }
+      
+      // Clean up markdown headers or list bullet points dynamically
+      var cleanLine = trimmedLine.replacingOccurrences(of: "^[\\d\\.\\-\\s\\*\\#\\:\\：]+", with: "", options: .regularExpression)
+      cleanLine = cleanLine.trimmingCharacters(in: .whitespacesAndNewlines)
+      
+      if cleanLine.isEmpty {
         continue
       }
+      
+      // Add commas to create a natural pause between list items if needed
       if combinedText.isEmpty {
-        combinedText = trimmedLine
+        if trimmedLine.hasSuffix(":") || trimmedLine.hasSuffix("：") {
+          combinedText = trimmedLine
+        } else {
+          combinedText = cleanLine
+        }
       } else {
-        combinedText += " " + trimmedLine
+        let lastChar = combinedText.last
+        let needsPause = lastChar != nil && !["。", "！", "？", ".", "!", "?", "，", ","].contains(String(lastChar!))
+        let separator = needsPause ? "，" : " "
+        combinedText += separator + cleanLine
       }
-      if combinedText.count >= 800 {
+      
+      lineCount += 1
+      if combinedText.count >= 400 || lineCount >= 6 {
         break
       }
     }
