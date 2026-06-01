@@ -100,6 +100,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc func toggleVoiceInput() {
+    // Protect active query/operation phase from accidental false wake-word or hotkey interrupts
+    if currentAskProcess != nil {
+      log("[Toggle] Ignored hotkey because an active query or desktop operation is currently running")
+      return
+    }
+
     cancelActiveVoiceOperations()
 
     if voiceManager.isListening {
