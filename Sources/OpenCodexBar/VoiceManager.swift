@@ -110,7 +110,13 @@ class VoiceManager: NSObject, AVAudioRecorderDelegate {
         ticksCount += 1
         
         rec.updateMeters()
-        let power = rec.averagePower(forChannel: 0)
+        var power = rec.averagePower(forChannel: 0)
+        
+        // Anti-Acoustic Feedback Loop: If the AI is currently playing TTS speech, treat it as silence
+        if let appDelegate = AppDelegate.shared, appDelegate.currentPlayProcess != nil {
+          power = -100.0
+        }
+        
         logCounter += 1
         if logCounter % 10 == 0 {
           AppDelegate.shared?.log("[VM Timer] Tick: power = \(power) dB, hasSpeechStarted = \(self.hasSpeechStarted), lowVolumeDuration = \(self.lowVolumeDuration)")
@@ -147,7 +153,12 @@ class VoiceManager: NSObject, AVAudioRecorderDelegate {
       self.meteringTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
         guard let self = self, let rec = self.recorder, rec.isRecording else { return }
         rec.updateMeters()
-        let power = rec.averagePower(forChannel: 0)
+        var power = rec.averagePower(forChannel: 0)
+        
+        // Anti-Acoustic Feedback Loop: If the AI is currently playing TTS speech, treat it as silence
+        if let appDelegate = AppDelegate.shared, appDelegate.currentPlayProcess != nil {
+          power = -100.0
+        }
         let minDb: Float = -60.0
         let maxDb: Float = -10.0
         let clamped = max(minDb, min(maxDb, power))

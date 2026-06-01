@@ -9,12 +9,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private var voiceManager: VoiceManager!
   private let replyFile = "/tmp/voice_reply.txt"
   private let logFile = "/tmp/ocb_debug.log"
-  private var player: AVAudioPlayer?
   private var sessionId: String?
   var hudWindowController: HUDWindowController?
   private var speakingTimer: Timer?
-  private var currentAskProcess: Process?
-  private var currentPlayProcess: Process?
+  var currentAskProcess: Process?
+  var currentPlayProcess: Process?
 
   func log(_ m: String) {
     if let h = FileHandle(forWritingAtPath: logFile) {
