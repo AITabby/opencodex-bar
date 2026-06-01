@@ -296,119 +296,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  private func splitTextIntoSentences(_ t: String) -> [String] {
-    var chunks: [String] = []
-    
-    // Split lines first
-    let lines = t.components(separatedBy: "\n")
-    for line in lines {
-      let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
-      if trimmedLine.isEmpty { continue }
-      
-      // Stop splitting if we hit code blocks or terminal command outputs
-      if trimmedLine.hasPrefix("```") || trimmedLine.hasPrefix("$ ") || trimmedLine.hasPrefix("npm ") || trimmedLine.hasPrefix("node ") {
-        break
-      }
-      
-      // Filter out markdown titles or numbers
-      var cleanLine = trimmedLine.replacingOccurrences(of: "^[\\d\\.\\-\\s\\*\\#\\:\\：]+", with: "", options: .regularExpression)
-      cleanLine = cleanLine.trimmingCharacters(in: .whitespacesAndNewlines)
-      if cleanLine.isEmpty { continue }
-      
-      // Use regular expression to split by sentence punctuation but keep the punctuation!
-      let pattern = "[^。！？!?；;]+[。！？!?；;]?"
-      if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
-        let nsStr = cleanLine as NSString
-        let matches = regex.matches(in: cleanLine, options: [], range: NSRange(location: 0, length: nsStr.length))
-        for m in matches {
-          let s = nsStr.substring(with: m.range).trimmingCharacters(in: .whitespacesAndNewlines)
-          if !s.isEmpty {
-            chunks.append(s)
-          }
-        }
-      } else {
-        chunks.append(cleanLine)
-      }
-    }
-    
-    // Fallback if split was completely empty
-    if chunks.isEmpty {
-      let fallback = t.replacingOccurrences(of: "^[\\d\\.\\-\\s\\*\\#]+", with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
-      if !fallback.isEmpty {
-        chunks.append(fallback)
-      }
-    }
-    
-    return chunks
-  }
-
   private func tts(_ t: String) {
-    // Clear any active queue and play tasks
     cancelActiveVoiceOperations()
     
-    // Split the text dynamically into clean sentences
-    ttsQueue = splitTextIntoSentences(t)
-    ttsQueueIndex = 0
-    preFetchedAudioData = nil
-    preFetchedIndex = -1
+    let cleaned = clean(t)
+    var shortText = cleaned
+    shortText = shortText.trimmingCharacters(in: .whitespacesAndNewlines)
     
-    log("[Queue] Created TTS queue with \(ttsQueue.count) sentences")
-    
-    guard !ttsQueue.isEmpty else {
-      self.stopSpeakingAnimation()
-      return
-    }
-    
-    // Start playing the first chunk immediately!
-    playQueueChunk(0)
-  }
-
-  private func playQueueChunk(_ index: Int) {
-    guard index < ttsQueue.count else {
-      self.log("[Queue] Finished playing all chunks")
-      self.stopSpeakingAnimation()
-      try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
-      return
-    }
-    
-    self.ttsQueueIndex = index
-    let currentText = ttsQueue[index]
-    self.log("[Queue] Playing chunk \(index)/\(ttsQueue.count): '\(currentText.prefix(30))...'")
-    
-    // Synchronously preload the next chunk in the background immediately
-    preFetchChunk(index + 1)
-    
-    // Check if we already pre-fetched this chunk
-    if preFetchedIndex == index, let audioData = preFetchedAudioData {
-      self.log("[Queue] Pre-fetched audio cache HIT for chunk \(index)")
-      self.playAudioData(audioData, forIndex: index)
-      self.preFetchedAudioData = nil
-      self.preFetchedIndex = -1
-    } else {
-      self.log("[Queue] Pre-fetch cache MISS for chunk \(index), synthesizing now...")
-      synthesizeChunk(currentText) { [weak self] audioData in
-        guard let s = self else { return }
-        s.playAudioData(audioData, forIndex: index)
+    if shortText.count > 800 {
+      let limit = 780
+      let substring = String(shortText.prefix(limit))
+      let boundaries: [Character] = ["。", "！", "？", ".", "!", "?", "，", ","]
+      if let lastBound = substring.lastIndex(where: { boundaries.contains($0) }) {
+        let nextIndex = substring.index(after: lastBound)
+        shortText = String(substring[..<nextIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+      } else {
+        shortText = substring + "..."
       }
     }
-  }
-
-  private func preFetchChunk(_ index: Int) {
-    guard index < ttsQueue.count else { return }
-    guard preFetchedIndex != index else { return } // already pre-fetched
     
-    let nextText = ttsQueue[index]
-    self.log("[Queue] Pre-fetching next chunk \(index): '\(nextText.prefix(20))...'")
+    log("[TTS] Synthesizing full reply text: '\(shortText.prefix(30))...'")
     
-    synthesizeChunk(nextText) { [weak self] audioData in
+    synthesizeFullReply(shortText) { [weak self] audioData in
       guard let s = self else { return }
-      s.preFetchedAudioData = audioData
-      s.preFetchedIndex = index
-      s.log("[Queue] Pre-fetched next chunk \(index) successfully!")
+      s.playFullAudio(audioData, text: shortText)
     }
   }
 
-  private func synthesizeChunk(_ text: String, completion: @escaping (Data) -> Void) {
+  private func synthesizeFullReply(_ text: String, completion: @escaping (Data) -> Void) {
     guard let jsonData = try? JSONSerialization.data(withJSONObject: ["text": text]) else { return }
     
     var request = URLRequest(url: URL(string: "http://localhost:8765/api/voice/tts")!)
@@ -418,11 +333,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       if let error = error {
-        self?.log("[Queue Err] Synthesis failed: \(error.localizedDescription)")
+        self?.log("[TTS Err] Synthesis failed: \(error.localizedDescription)")
         return
       }
       guard let data = data, !data.isEmpty else {
-        self?.log("[Queue Err] Empty audio data returned")
+        self?.log("[TTS Err] Empty audio data returned")
         return
       }
       completion(data)
@@ -430,7 +345,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     task.resume()
   }
 
-  private func playAudioData(_ data: Data, forIndex index: Int) {
+  private func playFullAudio(_ data: Data, text: String) {
     let mp3Url = "/tmp/ocb_tts.mp3"
     do {
       try data.write(to: URL(fileURLWithPath: mp3Url))
@@ -439,7 +354,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       try? "sending".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
       
       DispatchQueue.main.async { [weak self] in
-        self?.startSpeakingAnimation(text: self?.ttsQueue[index] ?? "")
+        self?.startSpeakingAnimation(text: text)
       }
       
       DispatchQueue.global().async { [weak self] in
@@ -456,16 +371,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         playTask.waitUntilExit()
         s.currentPlayProcess = nil
         
-        // Go to next chunk in main queue!
+        s.log("[TTS] Finished playing full audio")
+        try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+        
         DispatchQueue.main.async {
-          s.playQueueChunk(index + 1)
+          s.stopSpeakingAnimation()
         }
       }
     } catch {
-      self.log("[Queue Err] Failed to write/play audio: \(error.localizedDescription)")
-      // Force transition to next chunk so the queue doesn't hang
+      self.log("[TTS Err] Failed to write/play audio: \(error.localizedDescription)")
       DispatchQueue.main.async { [weak self] in
-        self?.playQueueChunk(index + 1)
+        self?.stopSpeakingAnimation()
       }
     }
   }
@@ -503,14 +419,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       let noise = Float.random(in: 0.2...0.8)
       let amp = base * noise * 0.8
       
-      var combinedText = text
-      if let s = self {
-        let nextIndex = s.ttsQueueIndex + 1
-        let nextText = nextIndex < s.ttsQueue.count ? s.ttsQueue[nextIndex] : ""
-        combinedText = "\(text)|\(nextText)"
-      }
-      
-      self?.hudWindowController?.updateState(state: "speaking", amplitude: amp, text: combinedText)
+      self?.hudWindowController?.updateState(state: "speaking", amplitude: amp, text: text)
     }
   }
 
