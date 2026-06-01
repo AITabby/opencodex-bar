@@ -296,10 +296,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
+  private func extractSpokenSummary(_ t: String) -> String {
+    let parts = t.components(separatedBy: "\n\n")
+    for part in parts {
+      let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.isEmpty { continue }
+      
+      if trimmed.hasPrefix("```") || trimmed.hasPrefix("|") || trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("1. ") || trimmed.hasPrefix("$ ") {
+        continue
+      }
+      return trimmed
+    }
+    
+    let lines = t.components(separatedBy: "\n")
+    for line in lines {
+      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.isEmpty || trimmed.hasPrefix("```") || trimmed.hasPrefix("|") || trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("1. ") || trimmed.hasPrefix("$ ") {
+        continue
+      }
+      return trimmed
+    }
+    
+    return t
+  }
+
   private func tts(_ t: String) {
     cancelActiveVoiceOperations()
     
-    let cleaned = clean(t)
+    let spokenText = extractSpokenSummary(t)
+    let cleaned = clean(spokenText)
     var shortText = cleaned
     shortText = shortText.trimmingCharacters(in: .whitespacesAndNewlines)
     
@@ -315,7 +340,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       }
     }
     
-    log("[TTS] Synthesizing full reply text: '\(shortText.prefix(30))...'")
+    log("[TTS] Synthesizing spoken summary: '\(shortText.prefix(30))...'")
     
     synthesizeFullReply(shortText) { [weak self] audioData in
       guard let s = self else { return }
