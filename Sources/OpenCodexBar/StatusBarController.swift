@@ -29,12 +29,24 @@ class StatusBarController {
     }
 
     updateIcon()
+    try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
     buildMenu()
   }
 
   func setStatus(_ status: AppStatus) {
     currentStatus = status
     updateIcon()
+
+    let statusStr: String
+    switch status {
+    case .idle: statusStr = "idle"
+    case .loading: statusStr = "loading"
+    case .listening: statusStr = "listening"
+    case .sending: statusStr = "sending"
+    case .error: statusStr = "error"
+    case .offline: statusStr = "offline"
+    }
+    try? statusStr.write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
 
     if status == .loading || status == .listening || status == .sending {
       startAnimation()
