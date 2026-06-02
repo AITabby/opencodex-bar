@@ -68,68 +68,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     // Execute AppleScript to resume other paused media
     let resumeScript = """
-    tell application "System Events"
-        set isMusicRunning to (exists process "Music")
-        set isSpotifyRunning to (exists process "Spotify")
-        set isSafariRunning to (exists process "Safari")
-        set isChromeRunning to (exists process "Google Chrome")
-    end tell
+    try
+        tell application "System Events" to set isMusicRunning to (exists process "Music")
+        if isMusicRunning then
+            run script "tell application \\"Music\\" to play"
+        end if
+    end try
     
-    if isMusicRunning then
-        try
-            tell application "Music" to play
-        end try
-    end if
+    try
+        tell application "System Events" to set isSpotifyRunning to (exists process "Spotify")
+        if isSpotifyRunning then
+            run script "tell application \\"Spotify\\" to play"
+        end if
+    end try
     
-    if isSpotifyRunning then
-        try
-            tell application "Spotify" to play
-        end try
-    end if
-    
-    if isSafariRunning then
-        try
-            tell application "Safari"
+    try
+        tell application "System Events" to set isSafariRunning to (exists process "Safari")
+        if isSafariRunning then
+            run script "tell application \\"Safari\\"
                 repeat with w in windows
                     repeat with t in tabs of w
                         try
-                            tell t to do JavaScript "
+                            tell t to do JavaScript \\"
                                 document.querySelectorAll('video, audio').forEach(el => {
                                     if (el.dataset.wasPlaying === 'true') {
                                         el.play();
                                         delete el.dataset.wasPlaying;
                                     }
                                 });
-                              "
+                              \\"
                         catch
                         end try
                     end repeat
                 end repeat
-            end tell
-        end try
-    end if
+            end tell"
+        end if
+    end try
     
-    if isChromeRunning then
-        try
-            tell application "Google Chrome"
+    try
+        tell application "System Events" to set isChromeRunning to (exists process "Google Chrome")
+        if isChromeRunning then
+            run script "tell application \\"Google Chrome\\"
                 repeat with w in windows
                     repeat with t in tabs of w
                         try
-                            tell t to execute javascript "
+                            tell t to execute javascript \\"
                                 document.querySelectorAll('video, audio').forEach(el => {
                                     if (el.dataset.wasPlaying === 'true') {
                                         el.play();
                                         delete el.dataset.wasPlaying;
                                     }
                                 });
-                            "
+                            \\"
                         catch
                         end try
                     end repeat
                 end repeat
-            end tell
-        end try
-    end if
+            end tell"
+        end if
+    end try
     """
     
     if let script = NSAppleScript(source: resumeScript) {
@@ -797,42 +794,42 @@ if __name__ == "__main__":
       let pauseScript = """
       var pausedApps = ""
       
-      tell application "System Events"
-          set isMusicRunning to (exists process "Music")
-          set isSpotifyRunning to (exists process "Spotify")
-          set isSafariRunning to (exists process "Safari")
-          set isChromeRunning to (exists process "Google Chrome")
-      end tell
+      try
+          tell application "System Events" to set isMusicRunning to (exists process "Music")
+          if isMusicRunning then
+              set isPlaying to false
+              try
+                  set isPlaying to (run script "tell application \\"Music\\" to return (player state is playing)")
+              end try
+              if isPlaying then
+                  run script "tell application \\"Music\\" to pause"
+                  set pausedApps to pausedApps & "Music,"
+              end if
+          end if
+      end try
       
-      if isMusicRunning then
-          try
-              tell application "Music"
-                  if player state is playing then
-                      pause
-                      set pausedApps to pausedApps & "Music,"
-                  end if
-              end tell
-          end try
-      end if
+      try
+          tell application "System Events" to set isSpotifyRunning to (exists process "Spotify")
+          if isSpotifyRunning then
+              set isPlaying to false
+              try
+                  set isPlaying to (run script "tell application \\"Spotify\\" to return (player state is playing)")
+              end try
+              if isPlaying then
+                  run script "tell application \\"Spotify\\" to pause"
+                  set pausedApps to pausedApps & "Spotify,"
+              end if
+          end if
+      end try
       
-      if isSpotifyRunning then
-          try
-              tell application "Spotify"
-                  if player state is playing then
-                      pause
-                      set pausedApps to pausedApps & "Spotify,"
-                  end if
-              end tell
-          end try
-      end if
-      
-      if isSafariRunning then
-          try
-              tell application "Safari"
+      try
+          tell application "System Events" to set isSafariRunning to (exists process "Safari")
+          if isSafariRunning then
+              run script "tell application \\"Safari\\"
                   repeat with w in windows
                       repeat with t in tabs of w
                           try
-                              tell t to do JavaScript "
+                              tell t to do JavaScript \\"
                                   let pausedAny = false;
                                   document.querySelectorAll('video, audio').forEach(el => {
                                       if (!el.paused) {
@@ -842,25 +839,24 @@ if __name__ == "__main__":
                                       }
                                   });
                                   pausedAny;
-                              "
-                              if result is true or result is "true" then
-                                  set pausedApps to pausedApps & "Safari,"
-                              end if
+                              \\"
                           catch
                           end try
                       end repeat
                   end repeat
-              end tell
-          end try
-      end if
+              end tell"
+              set pausedApps to pausedApps & "Safari,"
+          end if
+      end try
       
-      if isChromeRunning then
-          try
-              tell application "Google Chrome"
+      try
+          tell application "System Events" to set isChromeRunning to (exists process "Google Chrome")
+          if isChromeRunning then
+              run script "tell application \\"Google Chrome\\"
                   repeat with w in windows
                       repeat with t in tabs of w
                           try
-                              tell t to execute javascript "
+                              tell t to execute javascript \\"
                                   let pausedAny = false;
                                   document.querySelectorAll('video, audio').forEach(el => {
                                       if (!el.paused) {
@@ -870,17 +866,15 @@ if __name__ == "__main__":
                                       }
                                   });
                                   pausedAny;
-                              "
-                              if result is true or result is "true" then
-                                  set pausedApps to pausedApps & "Chrome,"
-                              end if
+                              \\"
                           catch
                           end try
                       end repeat
                   end repeat
-              end tell
-          end try
-      end if
+              end tell"
+              set pausedApps to pausedApps & "Chrome,"
+          end if
+      end try
       
       return pausedApps
       """
@@ -932,68 +926,65 @@ if __name__ == "__main__":
       let resumeScript = """
       set pausedApps to "\(appsToResume)"
       
-      tell application "System Events"
-          set isMusicRunning to (exists process "Music")
-          set isSpotifyRunning to (exists process "Spotify")
-          set isSafariRunning to (exists process "Safari")
-          set isChromeRunning to (exists process "Google Chrome")
-      end tell
+      try
+          tell application "System Events" to set isMusicRunning to (exists process "Music")
+          if pausedApps contains "Music" and isMusicRunning then
+              run script "tell application \\"Music\\" to play"
+          end if
+      end try
       
-      if pausedApps contains "Music" and isMusicRunning then
-          try
-              tell application "Music" to play
-          end try
-      end if
+      try
+          tell application "System Events" to set isSpotifyRunning to (exists process "Spotify")
+          if pausedApps contains "Spotify" and isSpotifyRunning then
+              run script "tell application \\"Spotify\\" to play"
+          end if
+      end try
       
-      if pausedApps contains "Spotify" and isSpotifyRunning then
-          try
-              tell application "Spotify" to play
-          end try
-      end if
-      
-      if pausedApps contains "Safari" and isSafariRunning then
-          try
-              tell application "Safari"
+      try
+          tell application "System Events" to set isSafariRunning to (exists process "Safari")
+          if pausedApps contains "Safari" and isSafariRunning then
+              run script "tell application \\"Safari\\"
                   repeat with w in windows
                       repeat with t in tabs of w
                           try
-                              tell t to do JavaScript "
+                              tell t to do JavaScript \\"
                                   document.querySelectorAll('video, audio').forEach(el => {
                                       if (el.dataset.wasPlaying === 'true') {
                                           el.play();
                                           delete el.dataset.wasPlaying;
                                       }
                                   });
-                                "
+                                \\"
                           catch
                           end try
                       end repeat
                   end repeat
-              end tell
-          end try
-      end if
+              end tell"
+          end if
+      end try
       
-      if pausedApps contains "Chrome" and isChromeRunning then
-          try
-              tell application "Google Chrome"
+      try
+          tell application "System Events" to set isChromeRunning to (exists process "Google Chrome")
+          if pausedApps contains "Chrome" and isChromeRunning then
+              run script "tell application \\"Google Chrome\\"
                   repeat with w in windows
                       repeat with t in tabs of w
                           try
-                              tell t to execute javascript "
+                              tell t to execute javascript \\"
                                   document.querySelectorAll('video, audio').forEach(el => {
                                       if (el.dataset.wasPlaying === 'true') {
                                           el.play();
                                           delete el.dataset.wasPlaying;
                                       }
                                   });
-                              "
+                              \\"
                           catch
                           end try
                       end repeat
                   end repeat
-              end tell
-          end try
-      end if
+              end tell"
+          end if
+      end try
       """
       
       if let script = NSAppleScript(source: resumeScript) {
