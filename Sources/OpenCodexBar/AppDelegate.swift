@@ -761,6 +761,7 @@ if __name__ == "__main__":
   private var pausedMediaApps: String = ""
   private var mediaFailsafeWorkItem: DispatchWorkItem?
   private var mediaMonitoringTimer: Timer?
+  private var suspendedPIDs = Set<Int>()
 
   private func getAudioPlayingPIDs() -> Set<Int> {
     var pids = Set<Int>()
@@ -790,11 +791,10 @@ if __name__ == "__main__":
     return pids
   }
 
-  private func getPIDsForProcessName(name: String) -> [Int] {
-    var pids: [Int] = []
+  private func getProcessPath(for pid: Int) -> String? {
     let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-    task.arguments = ["-f", name]
+    task.executableURL = URL(fileURLWithPath: "/bin/ps")
+    task.arguments = ["-p", "\(pid)", "-o", "comm="]
     let pipe = Pipe()
     task.standardOutput = pipe
     try? task.run()
@@ -802,44 +802,49 @@ if __name__ == "__main__":
     
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     if let output = String(data: data, encoding: .utf8) {
-      let lines = output.components(separatedBy: .newlines)
-      for line in lines {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let pid = Int(trimmed) {
-          pids.append(pid)
-        }
+      let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty {
+        return trimmed
       }
     }
-    return pids
+    return nil
   }
 
   private func monitorAndSuspendPlayingMedia() {
     let playingPids = self.getAudioPlayingPIDs()
     if playingPids.isEmpty { return }
     
-    let nativeApps = [
-        "抖音.app": "抖音", "TikTok.app": "TikTok", 
-        "NeteaseMusic.app": "NeteaseMusic", "QQMusic.app": "QQMusic", 
-        "TencentVideo.app": "TencentVideo", "腾讯视频.app": "腾讯视频", 
-        "Youku.app": "Youku", "优酷.app": "优酷", 
-        "iQIYI.app": "iQIYI", "爱奇艺.app": "爱奇艺"
-    ]
+    let ourPid = Int(getpid())
     
-    for (appFile, appName) in nativeApps {
-        let pids = self.getPIDsForProcessName(name: appName)
-        for pid in pids {
-            if playingPids.contains(pid) {
-                self.log("[Media Monitor] Suspending playing app \(appName) (PID: \(pid))")
-                let stopTask = Process()
-                stopTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-                stopTask.arguments = ["-STOP", "-f", appFile]
-                try? stopTask.run()
-                
-                if !self.pausedMediaApps.contains(appFile) {
-                    self.pausedMediaApps += "\(appFile),"
-                }
-            }
+    for pid in playingPids {
+        if pid == ourPid { continue }
+        
+        guard let procPath = self.getProcessPath(for: pid) else { continue }
+        let name = URL(fileURLWithPath: procPath).lastPathComponent.lowercased()
+        
+        // Exclude system and background servers
+        if name.contains("node") || name.contains("opencodex") || name.contains("coreaudiod") || name.contains("powerd") || name.contains("windowserver") || name.contains("launchd") {
+            continue
         }
+        
+        // Exclude browsers & media players that are handled gracefully via AppleScript
+        if name == "safari" || name == "chrome" || name == "google chrome" || name == "music" || name == "spotify" {
+            continue
+        }
+        
+        // Exclude if already suspended
+        if self.suspendedPIDs.contains(pid) {
+            continue
+        }
+        
+        // Suspend this active sound-emitting process!
+        self.log("[Media Monitor] Dynamically suspending active sound-emitting process: \(name) (PID: \(pid))")
+        let stopTask = Process()
+        stopTask.executableURL = URL(fileURLWithPath: "/bin/kill")
+        stopTask.arguments = ["-STOP", "\(pid)"]
+        try? stopTask.run()
+        
+        self.suspendedPIDs.insert(pid)
     }
   }
 
@@ -984,13 +989,25 @@ if __name__ == "__main__":
       self?.mediaMonitoringTimer = nil
     }
 
+    let pidsToResume = self.suspendedPIDs
+    self.suspendedPIDs.removeAll()
+
     let appsToResume = self.pausedMediaApps
     self.pausedMediaApps = ""
     
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       
-      // Resume native media apps instantly via SIGCONT
+      // Dynamically unfreeze all processes that we suspended
+      for pid in pidsToResume {
+          self.log("[Media Monitor] Dynamically unfreezing PID: \(pid)")
+          let contTask = Process()
+          contTask.executableURL = URL(fileURLWithPath: "/bin/kill")
+          contTask.arguments = ["-CONT", "\(pid)"]
+          try? contTask.run()
+      }
+      
+      // Resume native media apps instantly via SIGCONT (redundant fail-safe backup for standard player apps)
       let nativeApps = [
           "抖音.app", "TikTok.app", 
           "NeteaseMusic.app", "QQMusic.app", 
