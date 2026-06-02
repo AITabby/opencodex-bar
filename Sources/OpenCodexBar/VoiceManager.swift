@@ -35,8 +35,8 @@ class VoiceManager: NSObject, AVAudioRecorderDelegate {
   private var silenceTimer: Timer?
   private var meteringTimer: Timer?
   private var lowVolumeDuration: TimeInterval = 0.0
-  private var silenceThreshold: Float = -42.0 // Configured dynamically
-  private var requiredSilenceDuration: TimeInterval = 3.0 // Configured dynamically
+  private var silenceThreshold: Float = -35.0 // Configured dynamically
+  private var requiredSilenceDuration: TimeInterval = 2.0 // Configured dynamically
   private var hasSpeechStarted = false
   
   var amplitudeUpdateHandler: ((Float) -> Void)?
@@ -69,8 +69,8 @@ class VoiceManager: NSObject, AVAudioRecorderDelegate {
     
     // Load dynamic voice settings
     let voiceSettings = VoiceSettings.load()
-    self.silenceThreshold = voiceSettings.vad_threshold ?? -42.0
-    self.requiredSilenceDuration = voiceSettings.vad_duration ?? 3.0
+    self.silenceThreshold = voiceSettings.vad_threshold ?? -35.0
+    self.requiredSilenceDuration = voiceSettings.vad_duration ?? 2.0
     AppDelegate.shared?.log("[VM] Loaded settings: STT = \(voiceSettings.stt_engine ?? "local-whisper"), TTS = \(voiceSettings.tts_engine ?? "edge-tts")")
     
     // Configure audio recording settings (AAC compressed M4A)
