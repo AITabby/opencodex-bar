@@ -122,12 +122,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       voiceManager.stopListening()
       statusBar.setStatus(.idle)
       hudWindowController?.hideHUD()
+      resumeSystemMedia()
       return
     }
 
     statusBar.setStatus(.listening)
     hudWindowController?.showHUD()
     hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "正在倾听...")
+    pauseSystemMedia()
 
     voiceManager.amplitudeUpdateHandler = { [weak self] amp in
       self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "正在倾听...")
@@ -139,6 +141,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       guard let t = text else {
         s.statusBar.setStatus(.idle)
         s.hudWindowController?.hideHUD()
+        s.resumeSystemMedia()
         return
       }
       s.processVoice(t)
@@ -199,6 +202,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async {
           s.statusBar.setStatus(.idle)
           s.hudWindowController?.hideHUD()
+          s.resumeSystemMedia()
         }
         return
       }
@@ -513,6 +517,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     speakingTimer?.invalidate()
     speakingTimer = nil
     hudWindowController?.updateState(state: "idle", amplitude: 0.0, text: "已完成回复")
+    resumeSystemMedia()
     DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
       if self?.voiceManager.isListening == false && self?.speakingTimer == nil {
         self?.hudWindowController?.hideHUD()
@@ -664,5 +669,205 @@ if __name__ == "__main__":
     try? minimax.write(toFile: "/tmp/ocb_minimax_tts.py", atomically: true, encoding: .utf8)
     try? openai.write(toFile: "/tmp/ocb_openai_tts.py", atomically: true, encoding: .utf8)
     log("[App] Written helper python scripts to /tmp")
+  }
+
+  private var pausedMediaApps: String = ""
+
+  private func pauseSystemMedia() {
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self = self else { return }
+      
+      let pauseScript = """
+      var pausedApps = ""
+      
+      tell application "System Events"
+          set isMusicRunning to (exists process "Music")
+          set isSpotifyRunning to (exists process "Spotify")
+          set isSafariRunning to (exists process "Safari")
+          set isChromeRunning to (exists process "Google Chrome")
+      end tell
+      
+      if isMusicRunning then
+          try
+              tell application "Music"
+                  if player state is playing then
+                      pause
+                      set pausedApps to pausedApps & "Music,"
+                  end if
+              end tell
+          end try
+      end if
+      
+      if isSpotifyRunning then
+          try
+              tell application "Spotify"
+                  if player state is playing then
+                      pause
+                      set pausedApps to pausedApps & "Spotify,"
+                  end if
+              end tell
+          end try
+      end if
+      
+      if isSafariRunning then
+          try
+              tell application "Safari"
+                  repeat with w in windows
+                      repeat with t in tabs of w
+                          try
+                              tell t to do JavaScript "
+                                  let pausedAny = false;
+                                  document.querySelectorAll('video, audio').forEach(el => {
+                                      if (!el.paused) {
+                                          el.pause();
+                                          el.dataset.wasPlaying = 'true';
+                                          pausedAny = true;
+                                      }
+                                  });
+                                  pausedAny;
+                              "
+                              if result is true or result is "true" then
+                                  set pausedApps to pausedApps & "Safari,"
+                              end if
+                          catch
+                          end try
+                      end repeat
+                  end repeat
+              end tell
+          end try
+      end if
+      
+      if isChromeRunning then
+          try
+              tell application "Google Chrome"
+                  repeat with w in windows
+                      repeat with t in tabs of w
+                          try
+                              tell t to execute javascript "
+                                  let pausedAny = false;
+                                  document.querySelectorAll('video, audio').forEach(el => {
+                                      if (!el.paused) {
+                                          el.pause();
+                                          el.dataset.wasPlaying = 'true';
+                                          pausedAny = true;
+                                      }
+                                  });
+                                  pausedAny;
+                              "
+                              if result is true or result is "true" then
+                                  set pausedApps to pausedApps & "Chrome,"
+                              end if
+                          catch
+                          end try
+                      end repeat
+                  end repeat
+              end tell
+          end try
+      end if
+      
+      return pausedApps
+      """
+      
+      if let script = NSAppleScript(source: pauseScript) {
+          var error: NSDictionary?
+          let result = script.executeAndReturnError(&error)
+          if error == nil, let val = result.stringValue {
+              let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
+              if !trimmed.isEmpty {
+                  self.pausedMediaApps = trimmed
+                  self.log("[Media] Paused active playback in: \(trimmed)")
+              }
+          } else if let err = error {
+              self.log("[Media Err] Pause script failed: \(err)")
+          }
+      }
+    }
+  }
+
+  private func resumeSystemMedia() {
+    let appsToResume = self.pausedMediaApps
+    if appsToResume.isEmpty { return }
+    self.pausedMediaApps = ""
+    
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self = self else { return }
+      
+      let resumeScript = """
+      set pausedApps to "\(appsToResume)"
+      
+      tell application "System Events"
+          set isMusicRunning to (exists process "Music")
+          set isSpotifyRunning to (exists process "Spotify")
+          set isSafariRunning to (exists process "Safari")
+          set isChromeRunning to (exists process "Google Chrome")
+      end tell
+      
+      if pausedApps contains "Music" and isMusicRunning then
+          try
+              tell application "Music" to play
+          end try
+      end if
+      
+      if pausedApps contains "Spotify" and isSpotifyRunning then
+          try
+              tell application "Spotify" to play
+          end try
+      end if
+      
+      if pausedApps contains "Safari" and isSafariRunning then
+          try
+              tell application "Safari"
+                  repeat with w in windows
+                      repeat with t in tabs of w
+                          try
+                              tell t to do JavaScript "
+                                  document.querySelectorAll('video, audio').forEach(el => {
+                                      if (el.dataset.wasPlaying === 'true') {
+                                          el.play();
+                                          delete el.dataset.wasPlaying;
+                                      }
+                                  });
+                                "
+                          catch
+                          end try
+                      end repeat
+                  end repeat
+              end tell
+          end try
+      end if
+      
+      if pausedApps contains "Chrome" and isChromeRunning then
+          try
+              tell application "Google Chrome"
+                  repeat with w in windows
+                      repeat with t in tabs of w
+                          try
+                              tell t to execute javascript "
+                                  document.querySelectorAll('video, audio').forEach(el => {
+                                      if (el.dataset.wasPlaying === 'true') {
+                                          el.play();
+                                          delete el.dataset.wasPlaying;
+                                      }
+                                  });
+                              "
+                          catch
+                          end try
+                      end repeat
+                  end repeat
+              end tell
+          end try
+      end if
+      """
+      
+      if let script = NSAppleScript(source: resumeScript) {
+          var error: NSDictionary?
+          _ = script.executeAndReturnError(&error)
+          if error == nil {
+              self.log("[Media] Resumed playback successfully")
+          } else if let err = error {
+              self.log("[Media Err] Resume script failed: \(err)")
+          }
+      }
+    }
   }
 }
