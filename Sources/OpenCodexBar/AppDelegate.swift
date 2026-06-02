@@ -678,7 +678,13 @@ if __name__ == "__main__":
       guard let self = self else { return }
       
       // Suspend native media apps instantly via SIGSTOP
-      let nativeApps = ["抖音.app", "TikTok.app", "NeteaseMusic.app", "QQMusic.app"]
+      let nativeApps = [
+          "抖音.app", "TikTok.app", 
+          "NeteaseMusic.app", "QQMusic.app", 
+          "TencentVideo.app", "腾讯视频.app", 
+          "Youku.app", "优酷.app", 
+          "iQIYI.app", "爱奇艺.app"
+      ]
       for app in nativeApps {
           let stopTask = Process()
           stopTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
@@ -801,7 +807,13 @@ if __name__ == "__main__":
       guard let self = self else { return }
       
       // Resume native media apps instantly via SIGCONT
-      let nativeApps = ["抖音.app", "TikTok.app", "NeteaseMusic.app", "QQMusic.app"]
+      let nativeApps = [
+          "抖音.app", "TikTok.app", 
+          "NeteaseMusic.app", "QQMusic.app", 
+          "TencentVideo.app", "腾讯视频.app", 
+          "Youku.app", "优酷.app", 
+          "iQIYI.app", "爱奇艺.app"
+      ]
       for app in nativeApps {
           let contTask = Process()
           contTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
