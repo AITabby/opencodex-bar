@@ -760,6 +760,88 @@ if __name__ == "__main__":
 
   private var pausedMediaApps: String = ""
   private var mediaFailsafeWorkItem: DispatchWorkItem?
+  private var mediaMonitoringTimer: Timer?
+
+  private func getAudioPlayingPIDs() -> Set<Int> {
+    var pids = Set<Int>()
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+    task.arguments = ["-g", "assertions"]
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    try? task.run()
+    task.waitUntilExit()
+    
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    if let output = String(data: data, encoding: .utf8) {
+      let lines = output.components(separatedBy: .newlines)
+      for line in lines {
+        if line.contains("Created for PID:") {
+          let parts = line.components(separatedBy: "Created for PID:")
+          if parts.count > 1 {
+            let pidStr = parts[1].trimmingCharacters(in: .punctuationCharacters.union(.whitespacesAndNewlines))
+            if let pid = Int(pidStr) {
+              pids.insert(pid)
+            }
+          }
+        }
+      }
+    }
+    return pids
+  }
+
+  private func getPIDsForProcessName(name: String) -> [Int] {
+    var pids: [Int] = []
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    task.arguments = ["-f", name]
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    try? task.run()
+    task.waitUntilExit()
+    
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    if let output = String(data: data, encoding: .utf8) {
+      let lines = output.components(separatedBy: .newlines)
+      for line in lines {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let pid = Int(trimmed) {
+          pids.append(pid)
+        }
+      }
+    }
+    return pids
+  }
+
+  private func monitorAndSuspendPlayingMedia() {
+    let playingPids = self.getAudioPlayingPIDs()
+    if playingPids.isEmpty { return }
+    
+    let nativeApps = [
+        "抖音.app": "抖音", "TikTok.app": "TikTok", 
+        "NeteaseMusic.app": "NeteaseMusic", "QQMusic.app": "QQMusic", 
+        "TencentVideo.app": "TencentVideo", "腾讯视频.app": "腾讯视频", 
+        "Youku.app": "Youku", "优酷.app": "优酷", 
+        "iQIYI.app": "iQIYI", "爱奇艺.app": "爱奇艺"
+    ]
+    
+    for (appFile, appName) in nativeApps {
+        let pids = self.getPIDsForProcessName(name: appName)
+        for pid in pids {
+            if playingPids.contains(pid) {
+                self.log("[Media Monitor] Suspending playing app \(appName) (PID: \(pid))")
+                let stopTask = Process()
+                stopTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+                stopTask.arguments = ["-STOP", "-f", appFile]
+                try? stopTask.run()
+                
+                if !self.pausedMediaApps.contains(appFile) {
+                    self.pausedMediaApps += "\(appFile),"
+                }
+            }
+        }
+    }
+  }
 
   private func pauseSystemMedia() {
     // Cancel any existing failsafe timer first
@@ -773,23 +855,19 @@ if __name__ == "__main__":
     self.mediaFailsafeWorkItem = workItem
     DispatchQueue.main.asyncAfter(deadline: .now() + 35.0, execute: workItem)
 
+    // Start repeating 0.5s media monitoring timer on the main thread to dynamically capture & suspend audio-producing processes
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.mediaMonitoringTimer?.invalidate()
+      self.mediaMonitoringTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        self?.monitorAndSuspendPlayingMedia()
+      }
+      // Run immediately once to pause currently playing apps at recording start
+      self.monitorAndSuspendPlayingMedia()
+    }
+
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
-      
-      // Suspend native media apps instantly via SIGSTOP
-      let nativeApps = [
-          "抖音.app", "TikTok.app", 
-          "NeteaseMusic.app", "QQMusic.app", 
-          "TencentVideo.app", "腾讯视频.app", 
-          "Youku.app", "优酷.app", 
-          "iQIYI.app", "爱奇艺.app"
-      ]
-      for app in nativeApps {
-          let stopTask = Process()
-          stopTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-          stopTask.arguments = ["-STOP", "-f", app]
-          try? stopTask.run()
-      }
       
       let pauseScript = """
       var pausedApps = ""
@@ -899,6 +977,12 @@ if __name__ == "__main__":
     // Cancel the failsafe timer on clean resume
     self.mediaFailsafeWorkItem?.cancel()
     self.mediaFailsafeWorkItem = nil
+
+    // Invalidate and clear the monitoring timer on main thread
+    DispatchQueue.main.async { [weak self] in
+      self?.mediaMonitoringTimer?.invalidate()
+      self?.mediaMonitoringTimer = nil
+    }
 
     let appsToResume = self.pausedMediaApps
     self.pausedMediaApps = ""
