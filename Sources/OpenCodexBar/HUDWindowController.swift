@@ -98,8 +98,11 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
     }
   }
 
-  func hideHUD() {
-    guard let window = self.window, window.isVisible else { return }
+  func hideHUD(completion: (() -> Void)? = nil) {
+    guard let window = self.window, window.isVisible else {
+      completion?()
+      return
+    }
 
     let currentFrame = window.frame
     var targetFrame = currentFrame
@@ -113,6 +116,7 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
     }) {
       window.orderOut(nil)
       window.setFrame(currentFrame, display: false)
+      completion?()
     }
   }
 

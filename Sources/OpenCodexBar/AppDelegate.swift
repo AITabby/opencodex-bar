@@ -148,8 +148,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     if voiceManager.isListening {
       voiceManager.stopListening()
       statusBar.setStatus(.idle)
-      hudWindowController?.hideHUD()
-      resumeSystemMedia()
+      hudWindowController?.hideHUD { [weak self] in
+        self?.resumeSystemMedia()
+      }
       return
     }
 
@@ -167,8 +168,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       s.log("[STT] '\(text ?? "nil")'")
       guard let t = text else {
         s.statusBar.setStatus(.idle)
-        s.hudWindowController?.hideHUD()
-        s.resumeSystemMedia()
+        s.hudWindowController?.hideHUD { [weak s] in
+          s?.resumeSystemMedia()
+        }
         return
       }
       s.processVoice(t)
@@ -228,8 +230,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         s.log("[Empty]")
         DispatchQueue.main.async {
           s.statusBar.setStatus(.idle)
-          s.hudWindowController?.hideHUD()
-          s.resumeSystemMedia()
+          s.hudWindowController?.hideHUD { [weak s] in
+            s?.resumeSystemMedia()
+          }
         }
         return
       }
@@ -544,10 +547,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     speakingTimer?.invalidate()
     speakingTimer = nil
     hudWindowController?.updateState(state: "idle", amplitude: 0.0, text: "已完成回复")
-    resumeSystemMedia()
     DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-      if self?.voiceManager.isListening == false && self?.speakingTimer == nil {
-        self?.hudWindowController?.hideHUD()
+      guard let self = self else { return }
+      if self.voiceManager.isListening == false && self.speakingTimer == nil {
+        self.hudWindowController?.hideHUD { [weak self] in
+          self?.resumeSystemMedia()
+        }
       }
     }
   }
@@ -679,7 +684,6 @@ def main():
             headers=headers, 
             method="POST"
         )
-        
         with urllib.request.urlopen(req, timeout=15) as response:
             audio_bytes = response.read()
             with open(output_path, "wb") as f:
@@ -699,9 +703,31 @@ if __name__ == "__main__":
   }
 
   private var pausedMediaApps: String = ""
+  private var suspendedPIDs: Set<Int> = []
   private var mediaFailsafeWorkItem: DispatchWorkItem?
   private var mediaMonitoringTimer: Timer?
-  private var suspendedPIDs = Set<Int>()
+
+  // Dynamic loading of MediaRemote private framework (controls system-wide media cleanly without UI locks)
+  private func sendMediaRemoteCommand(_ command: Int32) {
+    let path = "/System/Library/PrivateFrameworks/MediaRemote.framework"
+    guard let bundle = CFBundleCreate(kCFAllocatorDefault, URL(fileURLWithPath: path) as CFURL) else {
+        log("[MediaRemote] Failed to create bundle")
+        return
+    }
+    if !CFBundleLoadExecutable(bundle) {
+        log("[MediaRemote] Failed to load executable")
+        return
+    }
+    
+    typealias SendCommandType = @convention(c) (Int32, AnyObject?) -> Bool
+    if let pointer = CFBundleGetFunctionPointerForName(bundle, "MRMediaRemoteSendCommand" as CFString) {
+        let sendCommand = unsafeBitCast(pointer, to: SendCommandType.self)
+        let success = sendCommand(command, nil)
+        log("[MediaRemote] Sent command \(command): success = \(success)")
+    } else {
+        log("[MediaRemote] Symbol not found")
+    }
+  }
 
   private func getAudioPlayingPIDs() -> Set<Int> {
     var pids = Set<Int>()
@@ -750,100 +776,46 @@ if __name__ == "__main__":
     return nil
   }
 
-  private func monitorAndSuspendPlayingMedia() {
-    let playingPids = self.getAudioPlayingPIDs()
-    if playingPids.isEmpty { return }
-    
-    let ourPid = Int(getpid())
-    
-    for pid in playingPids {
-        if pid == ourPid { continue }
-        
-        guard let procPath = self.getProcessPath(for: pid) else { continue }
-        let name = URL(fileURLWithPath: procPath).lastPathComponent.lowercased()
-        
-        // Exclude system and background servers
-        if name.contains("node") || name.contains("opencodex") || name.contains("coreaudiod") || name.contains("powerd") || name.contains("windowserver") || name.contains("launchd") {
-            continue
-        }
-        
-        // Exclude browsers & media players that are handled gracefully via AppleScript
-        if name == "safari" || name == "chrome" || name == "google chrome" || name == "music" || name == "spotify" {
-            continue
-        }
-        
-        // Exclude if already suspended
-        if self.suspendedPIDs.contains(pid) {
-            continue
-        }
-        
-        // Suspend this active sound-emitting process!
-        self.log("[Media Monitor] Dynamically suspending active sound-emitting process: \(name) (PID: \(pid))")
-        let stopTask = Process()
-        stopTask.executableURL = URL(fileURLWithPath: "/bin/kill")
-        stopTask.arguments = ["-STOP", "\(pid)"]
-        try? stopTask.run()
-        
-        self.suspendedPIDs.insert(pid)
-    }
-  }
-
   private func pauseSystemMedia() {
     // Cancel any existing failsafe timer first
     self.mediaFailsafeWorkItem?.cancel()
     
-    // Schedule a new failsafe timer to automatically thaw all apps after 35 seconds
+    // Schedule a new failsafe timer to automatically resume all apps after 120 seconds (2 minutes)
     let workItem = DispatchWorkItem { [weak self] in
-      self?.log("[Media Failsafe] Triggered 35-second safety resume.")
+      self?.log("[Media Failsafe] Triggered 120-second safety resume.")
       self?.resumeSystemMedia()
     }
     self.mediaFailsafeWorkItem = workItem
-    DispatchQueue.main.asyncAfter(deadline: .now() + 35.0, execute: workItem)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 120.0, execute: workItem)
 
-    // Start repeating 0.5s media monitoring timer on the main thread to dynamically capture & suspend audio-producing processes
+    // Dynamic 0.5s media monitoring timer: if any sound-producing app starts playing mid-session, we issue a MediaRemote Pause command to pause it gracefully
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       self.mediaMonitoringTimer?.invalidate()
       self.mediaMonitoringTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-        self?.monitorAndSuspendPlayingMedia()
+        guard let self = self else { return }
+        let playingPids = self.getAudioPlayingPIDs()
+        let ourPid = Int(getpid())
+        let afplayPid = self.currentPlayProcess?.processIdentifier
+        let hasActivePlayback = playingPids.contains { pid in
+            return pid != ourPid && (afplayPid == nil || pid != Int(afplayPid!))
+        }
+        if hasActivePlayback {
+            self.log("[Media Monitor] Audio playback detected mid-session. Graceful pause sent via MediaRemote.")
+            self.sendMediaRemoteCommand(1) // Pause
+        }
       }
-      // Run immediately once to pause currently playing apps at recording start
-      self.monitorAndSuspendPlayingMedia()
     }
 
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       
+      // Send dynamic native pause command system-wide
+      self.sendMediaRemoteCommand(1) // Pause
+      
+      // Execute AppleScript to pause active browser video/audio elements (Safari, Chrome)
       let pauseScript = """
-      var pausedApps = ""
-      
-      try
-          tell application "System Events" to set isMusicRunning to (exists process "Music")
-          if isMusicRunning then
-              set isPlaying to false
-              try
-                  set isPlaying to (run script "tell application \\"Music\\" to return (player state is playing)")
-              end try
-              if isPlaying then
-                  run script "tell application \\"Music\\" to pause"
-                  set pausedApps to pausedApps & "Music,"
-              end if
-          end if
-      end try
-      
-      try
-          tell application "System Events" to set isSpotifyRunning to (exists process "Spotify")
-          if isSpotifyRunning then
-              set isPlaying to false
-              try
-                  set isPlaying to (run script "tell application \\"Spotify\\" to return (player state is playing)")
-              end try
-              if isPlaying then
-                  run script "tell application \\"Spotify\\" to pause"
-                  set pausedApps to pausedApps & "Spotify,"
-              end if
-          end if
-      end try
+      set pausedApps to ""
       
       try
           tell application "System Events" to set isSafariRunning to (exists process "Safari")
@@ -911,8 +883,6 @@ if __name__ == "__main__":
                   self.pausedMediaApps = trimmed
                   self.log("[Media] Paused active playback in: \(trimmed)")
               }
-          } else if let err = error {
-              self.log("[Media Err] Pause script failed: \(err)")
           }
       }
     }
@@ -929,57 +899,19 @@ if __name__ == "__main__":
       self?.mediaMonitoringTimer = nil
     }
 
-    let pidsToResume = self.suspendedPIDs
-    self.suspendedPIDs.removeAll()
-
     let appsToResume = self.pausedMediaApps
     self.pausedMediaApps = ""
     
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       
-      // Dynamically unfreeze all processes that we suspended
-      for pid in pidsToResume {
-          self.log("[Media Monitor] Dynamically unfreezing PID: \(pid)")
-          let contTask = Process()
-          contTask.executableURL = URL(fileURLWithPath: "/bin/kill")
-          contTask.arguments = ["-CONT", "\(pid)"]
-          try? contTask.run()
-      }
-      
-      // Resume native media apps instantly via SIGCONT (redundant fail-safe backup for standard player apps)
-      let nativeApps = [
-          "抖音.app", "TikTok.app", 
-          "NeteaseMusic.app", "QQMusic.app", 
-          "TencentVideo.app", "腾讯视频.app", 
-          "Youku.app", "优酷.app", 
-          "iQIYI.app", "爱奇艺.app"
-      ]
-      for app in nativeApps {
-          let contTask = Process()
-          contTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-          contTask.arguments = ["-CONT", "-f", app]
-          try? contTask.run()
-      }
+      // Send dynamic native play command system-wide
+      self.sendMediaRemoteCommand(0) // Play
       
       if appsToResume.isEmpty { return }
       
       let resumeScript = """
       set pausedApps to "\(appsToResume)"
-      
-      try
-          tell application "System Events" to set isMusicRunning to (exists process "Music")
-          if pausedApps contains "Music" and isMusicRunning then
-              run script "tell application \\"Music\\" to play"
-          end if
-      end try
-      
-      try
-          tell application "System Events" to set isSpotifyRunning to (exists process "Spotify")
-          if pausedApps contains "Spotify" and isSpotifyRunning then
-              run script "tell application \\"Spotify\\" to play"
-          end if
-      end try
       
       try
           tell application "System Events" to set isSafariRunning to (exists process "Safari")
