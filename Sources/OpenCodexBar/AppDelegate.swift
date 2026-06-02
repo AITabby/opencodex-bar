@@ -186,7 +186,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 1. Conversational Queries: If the request is a simple greeting, casual conversation, or informational question, answer directly in natural text.
 2. Coding/Terminal Queries: If the request is a pure coding, file-compilation, or command-line developer task, you may use the standard developer shell/terminal/file tools.
 3. System/App/GUI Operations: For ANY other operational task (e.g. opening/managing desktop applications, visiting websites, clicking, typing, scrolling, searching the web, interactive screen tasks), you MUST execute it immediately using the macOS "computer_use" GUI automation tools. You are strictly forbidden from using any high-level "browser" or "chrome" webbridge plugins. You MUST operate the actual screen via computer_use tools (e.g. opening Google Chrome using the mouse/keyboard, typing the URL on the screen, clicking actual coordinates, etc.). Do not write bash/apple-scripts or explain your plan. Act directly on the screen.
-4. Response Format for Voice TTS: Always start your response with a single, highly coherent, substantive spoken summary paragraph (between 100 and 150 characters) optimized for being read out loud. For GUI or web tasks, do NOT just list mechanical actions (like "I opened Chrome" or "I scrolled"). Instead, summarize the actual substantive results, findings, or content of what you operated on (e.g., the key content of the clicked tweet or the search results). This first paragraph must be self-contained and ready for direct TTS. Leave a blank line, and then list any detailed step-by-step logs, full text, or technical breakdowns below it.
+4. Response Format for Voice TTS: Always start your response with a single, highly coherent, conversational spoken summary paragraph (strictly between 50 and 120 characters) optimized for direct TTS.
+- The first paragraph MUST be a high-level natural summary of your findings or results.
+- CRITICAL: You are strictly forbidden from listing raw items, trends, names, files, or specific lists in this first paragraph. For example, do NOT say "页面刷新成功，热门趋势有：第一是A，第二是B..." or read them out. Instead, say: "我已经为您刷新了页面并查看了热门趋势。今天的热点主要集中在科技与民生话题上，具体列表我已经为您整理在屏幕上了。"
+- You MUST leave a blank line (\n\n) right after this summary paragraph, and then place any raw tables, logs, list items, code blocks, or technical breakdowns below that blank line.
 """
 
     ask(routedPrompt) { [weak self] reply in
@@ -296,28 +299,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  private func extractSpokenSummary(_ t: String) -> String {
-    let parts = t.components(separatedBy: "\n\n")
-    for part in parts {
-      let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
-      if trimmed.isEmpty { continue }
-      
-      if trimmed.hasPrefix("```") || trimmed.hasPrefix("|") || trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("1. ") || trimmed.hasPrefix("$ ") {
-        continue
-      }
-      return trimmed
+  private func isStructuredLine(_ line: String) -> Bool {
+    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("```") || trimmed.hasPrefix("|") || trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") || trimmed.hasPrefix("$ ") || trimmed.hasPrefix("% ") {
+      return true
     }
-    
+    if trimmed.hasPrefix("• ") || trimmed.hasPrefix("◦ ") || trimmed.hasPrefix("▪ ") {
+      return true
+    }
+    if let regex = try? NSRegularExpression(pattern: "^[0-9]+[.\\)]\\s", options: []) {
+      let range = NSRange(location: 0, length: trimmed.utf16.count)
+      if regex.firstMatch(in: trimmed, options: [], range: range) != nil {
+        return true
+      }
+    }
+    return false
+  }
+
+  private func extractSpokenSummary(_ t: String) -> String {
     let lines = t.components(separatedBy: "\n")
+    var collected = [String]()
+    
     for line in lines {
       let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-      if trimmed.isEmpty || trimmed.hasPrefix("```") || trimmed.hasPrefix("|") || trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("1. ") || trimmed.hasPrefix("$ ") {
+      if trimmed.isEmpty {
         continue
       }
-      return trimmed
+      
+      if isStructuredLine(trimmed) {
+        break
+      }
+      
+      collected.append(trimmed)
     }
     
-    return t
+    let result = collected.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    if !result.isEmpty {
+      return result
+    }
+    
+    return "我已经为您整理好了，请在屏幕上查看具体内容。"
   }
 
   private func tts(_ t: String) {
