@@ -704,7 +704,6 @@ if __name__ == "__main__":
 
   private var pausedMediaApps: String = ""
   private var suspendedPIDs: Set<Int> = []
-  private var mediaFailsafeWorkItem: DispatchWorkItem?
   private var mediaMonitoringTimer: Timer?
 
   // Dynamic loading of MediaRemote private framework (controls system-wide media cleanly without UI locks)
@@ -777,16 +776,6 @@ if __name__ == "__main__":
   }
 
   private func pauseSystemMedia() {
-    // Cancel any existing failsafe timer first
-    self.mediaFailsafeWorkItem?.cancel()
-    
-    // Schedule a new failsafe timer to automatically resume all apps after 120 seconds (2 minutes)
-    let workItem = DispatchWorkItem { [weak self] in
-      self?.log("[Media Failsafe] Triggered 120-second safety resume.")
-      self?.resumeSystemMedia()
-    }
-    self.mediaFailsafeWorkItem = workItem
-    DispatchQueue.main.asyncAfter(deadline: .now() + 120.0, execute: workItem)
 
     // Dynamic 0.5s media monitoring timer: if any sound-producing app starts playing mid-session, we issue a MediaRemote Pause command to pause it gracefully
     DispatchQueue.main.async { [weak self] in
@@ -889,9 +878,6 @@ if __name__ == "__main__":
   }
 
   private func resumeSystemMedia() {
-    // Cancel the failsafe timer on clean resume
-    self.mediaFailsafeWorkItem?.cancel()
-    self.mediaFailsafeWorkItem = nil
 
     // Invalidate and clear the monitoring timer on main thread
     DispatchQueue.main.async { [weak self] in
