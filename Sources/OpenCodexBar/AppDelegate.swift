@@ -316,6 +316,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     return false
   }
 
+  private func cleanIntroductoryTail(_ text: String) -> String {
+    var sentences = [String]()
+    var current = ""
+    
+    for char in text {
+      current.append(char)
+      if char == "。" || char == "！" || char == "？" || char == "!" || char == "?" || char == "\n" {
+        let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+          sentences.append(trimmed)
+        }
+        current = ""
+      }
+    }
+    
+    let trimmedLast = current.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !trimmedLast.isEmpty {
+      sentences.append(trimmedLast)
+    }
+    
+    if sentences.isEmpty {
+      return ""
+    }
+    
+    if let last = sentences.last {
+      let lower = last.lowercased()
+      let isIntro = lower.hasSuffix("：") || lower.hasSuffix(":") || 
+                    lower.contains("如下") || lower.contains("以下") ||
+                    lower.contains("如下所示") || lower.contains("请看")
+      
+      if isIntro {
+        sentences.removeLast()
+      }
+    }
+    
+    return sentences.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
   private func extractSpokenSummary(_ t: String) -> String {
     let lines = t.components(separatedBy: "\n")
     var collected = [String]()
@@ -333,7 +371,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       collected.append(trimmed)
     }
     
-    let result = collected.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    let joined = collected.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    let result = cleanIntroductoryTail(joined)
+    
     if !result.isEmpty {
       return result
     }
