@@ -48,6 +48,96 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     try? registerHotkey()
   }
 
+  func applicationWillTerminate(_ aNotification: Notification) {
+    log("[App] Terminating. Resuming all system media to prevent frozen states.")
+    
+    // Synchronously thaw all processes immediately
+    let nativeApps = [
+        "抖音.app", "TikTok.app", 
+        "NeteaseMusic.app", "QQMusic.app", 
+        "TencentVideo.app", "腾讯视频.app", 
+        "Youku.app", "优酷.app", 
+        "iQIYI.app", "爱奇艺.app"
+    ]
+    for app in nativeApps {
+        let contTask = Process()
+        contTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        contTask.arguments = ["-CONT", "-f", app]
+        try? contTask.run()
+    }
+    
+    // Execute AppleScript to resume other paused media
+    let resumeScript = """
+    tell application "System Events"
+        set isMusicRunning to (exists process "Music")
+        set isSpotifyRunning to (exists process "Spotify")
+        set isSafariRunning to (exists process "Safari")
+        set isChromeRunning to (exists process "Google Chrome")
+    end tell
+    
+    if isMusicRunning then
+        try
+            tell application "Music" to play
+        end try
+    end if
+    
+    if isSpotifyRunning then
+        try
+            tell application "Spotify" to play
+        end try
+    end if
+    
+    if isSafariRunning then
+        try
+            tell application "Safari"
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        try
+                            tell t to do JavaScript "
+                                document.querySelectorAll('video, audio').forEach(el => {
+                                    if (el.dataset.wasPlaying === 'true') {
+                                        el.play();
+                                        delete el.dataset.wasPlaying;
+                                    }
+                                });
+                              "
+                        catch
+                        end try
+                    end repeat
+                end repeat
+            end tell
+        end try
+    end if
+    
+    if isChromeRunning then
+        try
+            tell application "Google Chrome"
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        try
+                            tell t to execute javascript "
+                                document.querySelectorAll('video, audio').forEach(el => {
+                                    if (el.dataset.wasPlaying === 'true') {
+                                        el.play();
+                                        delete el.dataset.wasPlaying;
+                                    }
+                                });
+                            "
+                        catch
+                        end try
+                    end repeat
+                end repeat
+            end tell
+        end try
+    end if
+    """
+    
+    if let script = NSAppleScript(source: resumeScript) {
+        var error: NSDictionary?
+        _ = script.executeAndReturnError(&error)
+    }
+  }
+
   private func setupMainMenu() {
     let mainMenu = NSMenu()
     let editMenuItem = NSMenuItem()
@@ -672,8 +762,20 @@ if __name__ == "__main__":
   }
 
   private var pausedMediaApps: String = ""
+  private var mediaFailsafeWorkItem: DispatchWorkItem?
 
   private func pauseSystemMedia() {
+    // Cancel any existing failsafe timer first
+    self.mediaFailsafeWorkItem?.cancel()
+    
+    // Schedule a new failsafe timer to automatically thaw all apps after 35 seconds
+    let workItem = DispatchWorkItem { [weak self] in
+      self?.log("[Media Failsafe] Triggered 35-second safety resume.")
+      self?.resumeSystemMedia()
+    }
+    self.mediaFailsafeWorkItem = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + 35.0, execute: workItem)
+
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       
@@ -800,6 +902,10 @@ if __name__ == "__main__":
   }
 
   private func resumeSystemMedia() {
+    // Cancel the failsafe timer on clean resume
+    self.mediaFailsafeWorkItem?.cancel()
+    self.mediaFailsafeWorkItem = nil
+
     let appsToResume = self.pausedMediaApps
     self.pausedMediaApps = ""
     
