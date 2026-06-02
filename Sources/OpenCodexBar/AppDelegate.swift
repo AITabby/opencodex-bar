@@ -11,6 +11,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private let logFile = "/tmp/ocb_debug.log"
   private var sessionId: String?
   var hudWindowController: HUDWindowController?
+  var notchDropZoneController: NotchDropZoneController?
+  var isWaitingForDropCommand = false
+  private var didPlayDropPrompt = false
+  private var currentDroppedFilePath: String?
+  private var didPauseMediaViaMediaRemote = false
   private var speakingTimer: Timer?
   var currentAskProcess: Process?
   var currentPlayProcess: Process?
@@ -31,6 +36,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     AppDelegate.shared = self
     voiceManager = VoiceManager()
     hudWindowController = HUDWindowController()
+    
+    notchDropZoneController = NotchDropZoneController(
+      onDragEntered: { [weak self] in
+        self?.handleDragEntered()
+      },
+      onDragExited: { [weak self] in
+        self?.handleDragExited()
+      },
+      onPerformDrop: { [weak self] urls in
+        self?.handlePerformDrop(urls)
+      }
+    )
     
     try? "".write(toFile: replyFile, atomically: true, encoding: .utf8)
     try? "".write(toFile: logFile, atomically: true, encoding: .utf8)
@@ -207,7 +224,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     log("[Go] \(text.prefix(30))")
     statusBar.setStatus(.sending)
-    hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "思考中...")
+    hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "Thinking...")
     try? text.write(toFile: "/tmp/voice_cmd.txt", atomically: true, encoding: .utf8)
 
     let routedPrompt = """
@@ -547,6 +564,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     speakingTimer?.invalidate()
     speakingTimer = nil
     hudWindowController?.updateState(state: "idle", amplitude: 0.0, text: "已完成回复")
+    
+    if isWaitingForDropCommand {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+        self?.startListeningForDropCommand()
+      }
+      return
+    }
+    
     DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
       guard let self = self else { return }
       if self.voiceManager.isListening == false && self.speakingTimer == nil {
@@ -741,19 +766,53 @@ if __name__ == "__main__":
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     if let output = String(data: data, encoding: .utf8) {
       let lines = output.components(separatedBy: .newlines)
+      var isRecordingAssertion = false
+      
       for line in lines {
-        if line.contains("Created for PID:") {
-          let parts = line.components(separatedBy: "Created for PID:")
-          if parts.count > 1 {
-            let pidStr = parts[1].trimmingCharacters(in: .punctuationCharacters.union(.whitespacesAndNewlines))
-            if let pid = Int(pidStr) {
-              pids.insert(pid)
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.starts(with: "pid ") || trimmed.contains("preventuseridlesleep") {
+          let lower = trimmed.lowercased()
+          isRecordingAssertion = lower.contains("record") || 
+                                 lower.contains("aggregate") || 
+                                 lower.contains("audio-in") ||
+                                 lower.contains("blackhole") ||
+                                 lower.contains("microphone") ||
+                                 lower.contains("input")
+        }
+        
+        if trimmed.contains("Created for PID:") {
+          if !isRecordingAssertion {
+            let parts = trimmed.components(separatedBy: "Created for PID:")
+            if parts.count > 1 {
+              let pidStr = parts[1].trimmingCharacters(in: .punctuationCharacters.union(.whitespacesAndNewlines))
+              if let pid = Int(pidStr) {
+                pids.insert(pid)
+              }
             }
           }
         }
       }
     }
-    return pids
+    
+    // Filter to only include media players and web browsers to avoid system daemons/recording tools
+    var filteredPids = Set<Int>()
+    for pid in pids {
+      if let path = getProcessPath(for: pid) {
+        let isUserApp = path.contains("/Applications/") ||
+                        path.contains("Safari.app") ||
+                        path.contains("Google Chrome") ||
+                        path.contains("com.apple.WebKit.WebContent") ||
+                        path.contains("WebKit.WebContent") ||
+                        path.contains("Spotify") ||
+                        path.contains("Music.app")
+        if isUserApp {
+          filteredPids.insert(pid)
+        } else {
+          log("[Media Filter] Ignored non-media PID: \(pid) (path: \(path))")
+        }
+      }
+    }
+    return filteredPids
   }
 
   private func getProcessPath(for pid: Int) -> String? {
@@ -776,6 +835,19 @@ if __name__ == "__main__":
   }
 
   private func pauseSystemMedia() {
+    let playingPids = self.getAudioPlayingPIDs()
+    let ourPid = Int(getpid())
+    let afplayPid = self.currentPlayProcess?.processIdentifier
+    let hasActivePlayback = playingPids.contains { pid in
+        return pid != ourPid && (afplayPid == nil || pid != Int(afplayPid!))
+    }
+    
+    if hasActivePlayback {
+        self.didPauseMediaViaMediaRemote = true
+        self.log("[Media] Active audio playback detected. Will issue MediaRemote Pause.")
+    } else {
+        self.didPauseMediaViaMediaRemote = false
+    }
 
     // Dynamic 0.5s media monitoring timer: if any sound-producing app starts playing mid-session, we issue a MediaRemote Pause command to pause it gracefully
     DispatchQueue.main.async { [weak self] in
@@ -792,6 +864,7 @@ if __name__ == "__main__":
         if hasActivePlayback {
             self.log("[Media Monitor] Audio playback detected mid-session. Graceful pause sent via MediaRemote.")
             self.sendMediaRemoteCommand(1) // Pause
+            self.didPauseMediaViaMediaRemote = true
         }
       }
     }
@@ -799,8 +872,9 @@ if __name__ == "__main__":
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       
-      // Send dynamic native pause command system-wide
-      self.sendMediaRemoteCommand(1) // Pause
+      if self.didPauseMediaViaMediaRemote {
+          self.sendMediaRemoteCommand(1) // Pause
+      }
       
       // Execute AppleScript to pause active browser video/audio elements (Safari, Chrome)
       let pauseScript = """
@@ -878,7 +952,6 @@ if __name__ == "__main__":
   }
 
   private func resumeSystemMedia() {
-
     // Invalidate and clear the monitoring timer on main thread
     DispatchQueue.main.async { [weak self] in
       self?.mediaMonitoringTimer?.invalidate()
@@ -891,8 +964,11 @@ if __name__ == "__main__":
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       
-      // Send dynamic native play command system-wide
-      self.sendMediaRemoteCommand(0) // Play
+      if self.didPauseMediaViaMediaRemote {
+          self.log("[Media] Resuming active playback via MediaRemote Play.")
+          self.sendMediaRemoteCommand(0) // Play
+          self.didPauseMediaViaMediaRemote = false
+      }
       
       if appsToResume.isEmpty { return }
       
@@ -913,7 +989,7 @@ if __name__ == "__main__":
                                           delete el.dataset.wasPlaying;
                                       }
                                   });
-                                \\"
+                                 \\"
                           catch
                           end try
                       end repeat
@@ -955,6 +1031,106 @@ if __name__ == "__main__":
               self.log("[Media Err] Resume script failed: \(err)")
           }
       }
+    }
+  }
+
+  func handleDragEntered() {
+    hudWindowController?.showHUD()
+    hudWindowController?.updateState(state: "draghover", amplitude: 0.0, text: "")
+  }
+
+  func handleDragExited() {
+    if voiceManager.isListening || currentAskProcess != nil || currentPlayProcess != nil { return }
+    hudWindowController?.hideHUD()
+  }
+
+  func handlePerformDrop(_ urls: [URL]) {
+    guard let url = urls.first else { return }
+    
+    if let sound = NSSound(contentsOfFile: "/System/Library/Sounds/Tink.aiff", byReference: true) {
+      sound.play()
+    }
+    
+    let ext = url.pathExtension.lowercased()
+    let filePath = "/tmp/dropped_file.\(ext)"
+    let destURL = URL(fileURLWithPath: filePath)
+    try? FileManager.default.removeItem(at: destURL)
+    try? FileManager.default.copyItem(at: url, to: destURL)
+    
+    self.currentDroppedFilePath = filePath
+    self.isWaitingForDropCommand = true
+    self.didPlayDropPrompt = false
+    
+    hudWindowController?.updateState(state: "dropabsorb", amplitude: 0.0, text: "")
+    
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+      self?.startListeningForDropCommand()
+    }
+  }
+
+  private func startListeningForDropCommand() {
+    cancelActiveVoiceOperations()
+    
+    statusBar.setStatus(.listening)
+    hudWindowController?.showHUD()
+    hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "正在倾听指令...")
+    pauseSystemMedia()
+
+    voiceManager.amplitudeUpdateHandler = { [weak self] amp in
+      self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "正在倾听指令...")
+    }
+
+    if !didPlayDropPrompt {
+      voiceManager.onNoSpeechTimeout = { [weak self] in
+        self?.handleDropCommandTimeout()
+      }
+    } else {
+      voiceManager.onNoSpeechTimeout = { [weak self] in
+        self?.cancelWaitingForDropCommand()
+      }
+    }
+
+    voiceManager.startListening { [weak self] text in
+      guard let s = self else { return }
+      s.voiceManager.onNoSpeechTimeout = nil
+      
+      guard s.isWaitingForDropCommand else { return }
+      
+      s.log("[Drop STT] '\(text ?? "nil")'")
+      guard let t = text, !t.isEmpty else {
+        s.cancelWaitingForDropCommand()
+        return
+      }
+      
+      s.processDropCommand(t)
+    }
+  }
+
+  private func handleDropCommandTimeout() {
+    didPlayDropPrompt = true
+    self.tts("我已经收到您的文件了，请问您需要我做什么？")
+  }
+
+  private func processDropCommand(_ command: String) {
+    guard let filePath = currentDroppedFilePath else { return }
+    isWaitingForDropCommand = false
+    
+    let url = URL(fileURLWithPath: filePath)
+    let fileName = url.lastPathComponent
+    
+    statusBar.setStatus(.sending)
+    hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "Thinking...")
+    pauseSystemMedia()
+    
+    let prompt = "我往你的刘海拖入了一个文件，该文件已保存在本地路径：\(filePath) (原文件名: \(fileName))。关于这个文件，我的指令是：\"\(command)\"。请读取文件内容并执行该指令，然后直接用语音简要回答我。"
+    processVoice(prompt)
+  }
+
+  private func cancelWaitingForDropCommand() {
+    isWaitingForDropCommand = false
+    statusBar.setStatus(.idle)
+    hudWindowController?.hideHUD { [weak self] in
+      self?.resumeSystemMedia()
     }
   }
 }

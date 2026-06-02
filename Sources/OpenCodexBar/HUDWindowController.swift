@@ -10,13 +10,13 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
   var webView: WKWebView!
 
   convenience init() {
-    let width: CGFloat = 420
-    let height: CGFloat = 92
+    let width: CGFloat = 360
+    let height: CGFloat = 180
 
     let screen = NSScreen.main ?? NSScreen.screens.first
-    let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-    let x = visibleFrame.origin.x + (visibleFrame.width - width) / 2
-    let y = visibleFrame.origin.y + 24
+    let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    let x = screenFrame.origin.x + (screenFrame.width - width) / 2
+    let y = screenFrame.origin.y + screenFrame.height - height
 
     let contentRect = NSRect(x: x, y: y, width: width, height: height)
 
@@ -30,7 +30,7 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
     window.backgroundColor = .clear
     window.isOpaque = false
     window.hasShadow = false
-    window.level = .floating
+    window.level = .statusBar
     window.ignoresMouseEvents = true
     window.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle]
 
@@ -73,15 +73,30 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
   func loadVisualizer() {
     let t = Int(Date().timeIntervalSince1970)
     guard let url = URL(string: "http://localhost:8765/visualizer?mode=hud&t=\(t)") else { return }
-    webView.load(URLRequest(url: url))
+    
+    let dataStore = WKWebsiteDataStore.default()
+    dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: Date(timeIntervalSince1970: 0)) { [weak self] in
+      guard let self = self else { return }
+      self.webView.load(URLRequest(url: url))
+    }
   }
 
   func showHUD() {
     guard let window = self.window else { return }
 
-    let finalFrame = window.frame
+    let screen = NSScreen.main ?? NSScreen.screens.first
+    let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    let height = window.frame.height
+    
+    let finalFrame = NSRect(
+      x: screenFrame.origin.x + (screenFrame.width - window.frame.width) / 2,
+      y: screenFrame.origin.y + screenFrame.height - height,
+      width: window.frame.width,
+      height: height
+    )
+    
     var startFrame = finalFrame
-    startFrame.origin.y -= 25
+    startFrame.origin.y = screenFrame.origin.y + screenFrame.height
 
     window.setFrame(startFrame, display: true)
     window.alphaValue = 0.0
@@ -104,9 +119,12 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
       return
     }
 
+    let screen = NSScreen.main ?? NSScreen.screens.first
+    let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    
     let currentFrame = window.frame
     var targetFrame = currentFrame
-    targetFrame.origin.y -= 25
+    targetFrame.origin.y = screenFrame.origin.y + screenFrame.height
 
     NSAnimationContext.runAnimationGroup({ context in
       context.duration = 0.3

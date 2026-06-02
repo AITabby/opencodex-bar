@@ -39,6 +39,9 @@ class VoiceManager: NSObject, AVAudioRecorderDelegate {
   private var requiredSilenceDuration: TimeInterval = 2.0 // Configured dynamically
   private var hasSpeechStarted = false
   
+  var onNoSpeechTimeout: (() -> Void)?
+  private var noSpeechDuration: TimeInterval = 0.0
+  
   var amplitudeUpdateHandler: ((Float) -> Void)?
 
   var isListening: Bool {
@@ -100,6 +103,7 @@ class VoiceManager: NSObject, AVAudioRecorderDelegate {
       
       // Start real-time Voice Activity Detection (VAD) silence monitoring
       lowVolumeDuration = 0.0
+      noSpeechDuration = 0.0
       hasSpeechStarted = false
       silenceTimer?.invalidate()
       
@@ -127,6 +131,17 @@ class VoiceManager: NSObject, AVAudioRecorderDelegate {
           self.hasSpeechStarted = false
           self.lowVolumeDuration = 0.0
           return
+        }
+        
+        if !self.hasSpeechStarted {
+          self.noSpeechDuration += 0.1
+          if self.onNoSpeechTimeout != nil && self.noSpeechDuration >= 4.0 {
+            AppDelegate.shared?.log("[VAD] User didn't speak for 4 seconds since start, triggering timeout...")
+            let handler = self.onNoSpeechTimeout
+            self.stopListening()
+            handler?()
+            return
+          }
         }
         
         if power >= self.silenceThreshold {
@@ -199,7 +214,7 @@ class VoiceManager: NSObject, AVAudioRecorderDelegate {
     
     // Immediately show "Thinking..." status on the HUD as soon as recording finishes/transcription begins
     DispatchQueue.main.async {
-      AppDelegate.shared?.hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "思考中...")
+      AppDelegate.shared?.hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "Thinking...")
       AppDelegate.shared?.statusBar.setStatus(.sending)
     }
     
