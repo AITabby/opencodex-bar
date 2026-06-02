@@ -677,16 +677,14 @@ if __name__ == "__main__":
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       
-      // Suspend native media apps like Douyin and TikTok instantly via SIGSTOP
-      let stopTask = Process()
-      stopTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-      stopTask.arguments = ["-STOP", "-f", "抖音.app"]
-      try? stopTask.run()
-      
-      let stopTikTok = Process()
-      stopTikTok.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-      stopTikTok.arguments = ["-STOP", "-f", "TikTok.app"]
-      try? stopTikTok.run()
+      // Suspend native media apps instantly via SIGSTOP
+      let nativeApps = ["抖音.app", "TikTok.app", "NeteaseMusic.app", "QQMusic.app"]
+      for app in nativeApps {
+          let stopTask = Process()
+          stopTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+          stopTask.arguments = ["-STOP", "-f", app]
+          try? stopTask.run()
+      }
       
       let pauseScript = """
       var pausedApps = ""
@@ -802,16 +800,14 @@ if __name__ == "__main__":
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       
-      // Resume native media apps like Douyin and TikTok instantly via SIGCONT
-      let contTask = Process()
-      contTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-      contTask.arguments = ["-CONT", "-f", "抖音.app"]
-      try? contTask.run()
-      
-      let contTikTok = Process()
-      contTikTok.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-      contTikTok.arguments = ["-CONT", "-f", "TikTok.app"]
-      try? contTikTok.run()
+      // Resume native media apps instantly via SIGCONT
+      let nativeApps = ["抖音.app", "TikTok.app", "NeteaseMusic.app", "QQMusic.app"]
+      for app in nativeApps {
+          let contTask = Process()
+          contTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+          contTask.arguments = ["-CONT", "-f", app]
+          try? contTask.run()
+      }
       
       if appsToResume.isEmpty { return }
       
