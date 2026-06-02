@@ -51,7 +51,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   func applicationWillTerminate(_ aNotification: Notification) {
     log("[App] Terminating. Resuming all system media to prevent frozen states.")
     
-    // Synchronously thaw all processes immediately
+    // Synchronously thaw native media apps instantly via SIGCONT (takes <1ms)
     let nativeApps = [
         "抖音.app", "TikTok.app", 
         "NeteaseMusic.app", "QQMusic.app", 
@@ -66,72 +66,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? contTask.run()
     }
     
-    // Execute AppleScript to resume other paused media
-    let resumeScript = """
-    try
-        tell application "System Events" to set isMusicRunning to (exists process "Music")
-        if isMusicRunning then
-            run script "tell application \\"Music\\" to play"
-        end if
-    end try
-    
-    try
-        tell application "System Events" to set isSpotifyRunning to (exists process "Spotify")
-        if isSpotifyRunning then
-            run script "tell application \\"Spotify\\" to play"
-        end if
-    end try
-    
-    try
-        tell application "System Events" to set isSafariRunning to (exists process "Safari")
-        if isSafariRunning then
-            run script "tell application \\"Safari\\"
-                repeat with w in windows
-                    repeat with t in tabs of w
-                        try
-                            tell t to do JavaScript \\"
-                                document.querySelectorAll('video, audio').forEach(el => {
-                                    if (el.dataset.wasPlaying === 'true') {
-                                        el.play();
-                                        delete el.dataset.wasPlaying;
-                                    }
-                                });
-                              \\"
-                        catch
-                        end try
-                    end repeat
-                end repeat
-            end tell"
-        end if
-    end try
-    
-    try
-        tell application "System Events" to set isChromeRunning to (exists process "Google Chrome")
-        if isChromeRunning then
-            run script "tell application \\"Google Chrome\\"
-                repeat with w in windows
-                    repeat with t in tabs of w
-                        try
-                            tell t to execute javascript \\"
-                                document.querySelectorAll('video, audio').forEach(el => {
-                                    if (el.dataset.wasPlaying === 'true') {
-                                        el.play();
-                                        delete el.dataset.wasPlaying;
-                                    }
-                                });
-                            \\"
-                        catch
-                        end try
-                    end repeat
-                end repeat
-            end tell"
-        end if
-    end try
-    """
-    
-    if let script = NSAppleScript(source: resumeScript) {
-        var error: NSDictionary?
-        _ = script.executeAndReturnError(&error)
+    // Dynamically thaw any active PIDs we suspended during the active session (takes <1ms)
+    for pid in self.suspendedPIDs {
+        let contTask = Process()
+        contTask.executableURL = URL(fileURLWithPath: "/bin/kill")
+        contTask.arguments = ["-CONT", "\(pid)"]
+        try? contTask.run()
     }
   }
 
