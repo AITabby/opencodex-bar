@@ -24,6 +24,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private var preFetchedAudioData: Data? = nil
   private var preFetchedIndex: Int = -1
 
+  private var playQueue: [(data: Data, text: String)] = []
+  private var isPlayingQueue = false
+  private var playChunkIndex = 0
+  private var didPlayResponseChime = false
+  private var streamResponseText = ""
+  private var streamCurrentSentence = ""
+  private var streamHasHitStructuredLine = false
+  private var didSynthesizeAnySpeech = false
+  private let streamingQueue = DispatchQueue(label: "com.opencodex.streaming")
+  private var currentQuerySequence = 0
+  private var nextSentenceIndex = 0
+  private var nextPlayIndex = 0
+  private var pendingAudioMap: [Int: (data: Data, text: String)] = [:]
+  private var expectedSentenceCount: Int? = nil
+
   func log(_ m: String) {
     if let h = FileHandle(forWritingAtPath: logFile) {
       h.seekToEndOfFile()
@@ -133,24 +148,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func cancelActiveVoiceOperations() {
-    if let existingAsk = currentAskProcess, existingAsk.isRunning {
-      existingAsk.terminate()
+    currentQuerySequence += 1
+    if let existingAsk = currentAskProcess {
+      if let outPipe = existingAsk.standardOutput as? Pipe {
+        outPipe.fileHandleForReading.readabilityHandler = nil
+      }
+      if let errPipe = existingAsk.standardError as? Pipe {
+        errPipe.fileHandleForReading.readabilityHandler = nil
+      }
+      if existingAsk.isRunning {
+        existingAsk.terminate()
+      }
       log("[Voice] Terminated active Codex query")
       currentAskProcess = nil
     }
-    if let existingPlay = currentPlayProcess, existingPlay.isRunning {
-      existingPlay.terminate()
-      log("[Voice] Terminated active afplay playback")
+    if let existingPlay = currentPlayProcess {
+      if existingPlay.isRunning {
+        existingPlay.terminate()
+        log("[Voice] Terminated active afplay playback")
+      }
       currentPlayProcess = nil
     }
     speakingTimer?.invalidate()
     speakingTimer = nil
+    
+    // Invalidate media monitoring timer
+    mediaMonitoringTimer?.invalidate()
+    mediaMonitoringTimer = nil
     
     // Clear queues
     ttsQueue.removeAll()
     ttsQueueIndex = 0
     preFetchedAudioData = nil
     preFetchedIndex = -1
+    
+    // Clear playback queues
+    playQueue.removeAll()
+    isPlayingQueue = false
+    nextSentenceIndex = 0
+    nextPlayIndex = 0
+    pendingAudioMap.removeAll()
+    expectedSentenceCount = nil
   }
 
   @objc func toggleVoiceInput() {
@@ -241,6 +279,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 - You MUST leave a blank line (\n\n) right after this summary paragraph, and then place any raw tables, logs, list items, code blocks, or technical breakdowns below that blank line.
 """
 
+    // Reset streaming state before asking
+    self.streamResponseText = ""
+    self.streamCurrentSentence = ""
+    self.streamHasHitStructuredLine = false
+    self.didPlayResponseChime = false
+    self.didSynthesizeAnySpeech = false
+    self.nextSentenceIndex = 0
+    self.nextPlayIndex = 0
+    self.pendingAudioMap.removeAll()
+    self.expectedSentenceCount = nil
+
     ask(routedPrompt) { [weak self] reply in
       guard let s = self else { return }
       guard !reply.isEmpty else {
@@ -255,15 +304,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       }
       
       let c = s.clean(reply)
-      s.log("[TTS] \(c.prefix(40))")
+      s.log("[LLM Done] Output text written to file. VAD summary speaking is already streaming.")
       try? c.write(toFile: s.replyFile, atomically: true, encoding: .utf8)
 
-      // Play a pleasant macOS system Glass chime to notify user that processing is complete and the AI is about to speak
-      if let sound = NSSound(contentsOfFile: "/System/Library/Sounds/Glass.aiff", byReference: true) {
-        sound.play()
-      }
-
-      s.tts(c)
       DispatchQueue.main.async {
         s.statusBar.setStatus(.idle)
       }
@@ -312,22 +355,92 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       task.standardInput = inPipe
 
       let sem = DispatchSemaphore(value: 0)
-      task.terminationHandler = { _ in sem.signal() }
-
       var errData = Data()
+      let errQueue = DispatchQueue(label: "com.opencodex.err")
+      
+      task.terminationHandler = { [weak self] _ in
+        guard let self = self else {
+          sem.signal()
+          return
+        }
+        
+        outPipe.fileHandleForReading.readabilityHandler = nil
+        errPipe.fileHandleForReading.readabilityHandler = nil
+        
+        let activeSeq = self.currentQuerySequence
+        self.streamingQueue.async { [weak self] in
+          guard let self = self else { return }
+          if self.currentQuerySequence != activeSeq {
+            return
+          }
+          let remaining = self.streamCurrentSentence.trimmingCharacters(in: .whitespacesAndNewlines)
+          self.streamCurrentSentence = ""
+          
+          if !remaining.isEmpty && !self.streamHasHitStructuredLine && !self.isStructuredLine(remaining) {
+            let cleaned = self.cleanIntroductoryTail(remaining)
+            let finalCleaned = self.clean(cleaned).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !finalCleaned.isEmpty {
+              self.log("[Stream TTS Final] Sending remaining: '\(finalCleaned)'")
+              self.didSynthesizeAnySpeech = true
+              let currentIdx = self.nextSentenceIndex
+              self.nextSentenceIndex += 1
+              self.synthesizeFullReply(finalCleaned) { [weak self] audioData in
+                guard let self = self else { return }
+                if self.currentQuerySequence == activeSeq {
+                  self.queueAudio(audioData, text: finalCleaned, index: currentIdx)
+                }
+              }
+            }
+          }
+          
+          if !self.didSynthesizeAnySpeech {
+            let fallback = "我已经为您整理好了，请在屏幕上查看具体内容。"
+            self.log("[Stream TTS Fallback] Sending default text")
+            self.didSynthesizeAnySpeech = true
+            let currentIdx = self.nextSentenceIndex
+            self.nextSentenceIndex += 1
+            self.synthesizeFullReply(fallback) { [weak self] audioData in
+              guard let self = self else { return }
+              if self.currentQuerySequence == activeSeq {
+                self.queueAudio(audioData, text: fallback, index: currentIdx)
+              }
+            }
+          }
+          
+          self.expectedSentenceCount = self.nextSentenceIndex
+          self.processPlayQueue()
+        }
+        
+        sem.signal()
+      }
+
       do {
+        outPipe.fileHandleForReading.readabilityHandler = { [weak self] fileHandle in
+          guard let self = self else { return }
+          let data = fileHandle.availableData
+          if data.isEmpty { return }
+          if let chunk = String(data: data, encoding: .utf8) {
+            let activeSeq = self.currentQuerySequence
+            self.processStreamingChunk(chunk, querySeq: activeSeq)
+          }
+        }
+
+        errPipe.fileHandleForReading.readabilityHandler = { fileHandle in
+          let data = fileHandle.availableData
+          if !data.isEmpty {
+            errQueue.async {
+              errData.append(data)
+            }
+          }
+        }
+
         try task.run()
         inPipe.fileHandleForWriting.write((prompt + "\n").data(using: .utf8)!)
         try inPipe.fileHandleForWriting.close()
 
-        DispatchQueue(label: "err").async {
-          errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        }
-
         sem.wait()
         self.currentAskProcess = nil
 
-        var output = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         if self.sessionId == nil {
           let errStr = String(data: errData, encoding: .utf8) ?? ""
           if let r = errStr.range(of: "session id: ([\\w-]+)", options: .regularExpression) {
@@ -338,14 +451,170 @@ class AppDelegate: NSObject, NSApplicationDelegate {
           }
         }
 
+        var output = self.streamResponseText
         output = output.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
         output = output.trimmingCharacters(in: .whitespacesAndNewlines)
         self.log("[Resp] \(output.prefix(80))")
         DispatchQueue.main.async { cb(output) }
       } catch {
         self.currentAskProcess = nil
+        outPipe.fileHandleForReading.readabilityHandler = nil
+        errPipe.fileHandleForReading.readabilityHandler = nil
         self.log("[Ask Err] \(error.localizedDescription)")
         DispatchQueue.main.async { cb("[错误]") }
+      }
+    }
+  }
+
+  private func processStreamingChunk(_ chunk: String, querySeq: Int) {
+    streamingQueue.async { [weak self] in
+      guard let self = self else { return }
+      if self.currentQuerySequence != querySeq {
+        return
+      }
+      self.streamResponseText += chunk
+      
+      if self.streamHasHitStructuredLine {
+        return
+      }
+      
+      for char in chunk {
+        self.streamCurrentSentence.append(char)
+        
+        if char == "。" || char == "！" || char == "？" || char == "!" || char == "?" || char == "\n" {
+          let sentence = self.streamCurrentSentence.trimmingCharacters(in: .whitespacesAndNewlines)
+          self.streamCurrentSentence = ""
+          
+          if !sentence.isEmpty {
+            if self.isStructuredLine(sentence) {
+              self.streamHasHitStructuredLine = true
+              return
+            }
+            
+            let cleaned = self.cleanIntroductoryTail(sentence)
+            let finalCleaned = self.clean(cleaned).trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            if !finalCleaned.isEmpty {
+              self.log("[Stream TTS] Sending sentence: '\(finalCleaned)'")
+              self.didSynthesizeAnySpeech = true
+              let currentIdx = self.nextSentenceIndex
+              self.nextSentenceIndex += 1
+              self.synthesizeFullReply(finalCleaned) { [weak self] audioData in
+                guard let self = self else { return }
+                if self.currentQuerySequence == querySeq {
+                  self.queueAudio(audioData, text: finalCleaned, index: currentIdx)
+                } else {
+                  self.log("[Stream TTS] Discarding stale audio for sentence: '\(finalCleaned)'")
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private func queueAudio(_ data: Data, text: String, index: Int) {
+    streamingQueue.async { [weak self] in
+      guard let self = self else { return }
+      self.pendingAudioMap[index] = (data: data, text: text)
+      self.processPlayQueue()
+    }
+  }
+
+  private func processPlayQueue() {
+    if isPlayingQueue {
+      return
+    }
+    
+    if let expected = expectedSentenceCount, nextPlayIndex >= expected {
+      try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+      DispatchQueue.main.async { [weak self] in
+        self?.stopSpeakingAnimation()
+      }
+      return
+    }
+    
+    guard let nextItem = pendingAudioMap[nextPlayIndex] else {
+      return
+    }
+    
+    pendingAudioMap.removeValue(forKey: nextPlayIndex)
+    nextPlayIndex += 1
+    
+    playQueue.append(nextItem)
+    playNextQueueItem()
+  }
+
+  private func playNextQueueItem() {
+    guard !playQueue.isEmpty else {
+      isPlayingQueue = false
+      try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+      DispatchQueue.main.async { [weak self] in
+        self?.stopSpeakingAnimation()
+      }
+      return
+    }
+    
+    isPlayingQueue = true
+    let item = playQueue.removeFirst()
+    let data = item.data
+    let text = item.text
+    let isWav = data.count >= 4 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 // "RIFF"
+    let ext = isWav ? "wav" : "mp3"
+    let chunkFile = "/tmp/ocb_tts_chunk_\(playChunkIndex).\(ext)"
+    playChunkIndex += 1
+    
+    do {
+      try data.write(to: URL(fileURLWithPath: chunkFile))
+      
+      // Update speaking status for VAD sync
+      try? "sending".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+      
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        // Play response chime only once per query
+        if !self.didPlayResponseChime {
+          self.didPlayResponseChime = true
+          if let sound = NSSound(contentsOfFile: "/System/Library/Sounds/Glass.aiff", byReference: true) {
+            sound.play()
+          }
+        }
+        self.startSpeakingAnimation(text: text)
+      }
+      
+      DispatchQueue.global().async { [weak self] in
+        guard let s = self else { return }
+        
+        let p = Process()
+        s.currentPlayProcess = p
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+        p.arguments = [chunkFile]
+        p.terminationHandler = { [weak s] _ in
+          try? FileManager.default.removeItem(atPath: chunkFile)
+          s?.streamingQueue.async {
+            s?.currentPlayProcess = nil
+            s?.isPlayingQueue = false
+            s?.processPlayQueue()
+          }
+        }
+        do {
+          try p.run()
+        } catch {
+          s.log("[Play Queue Err] \(error.localizedDescription)")
+          s.streamingQueue.async {
+            s.currentPlayProcess = nil
+            s.isPlayingQueue = false
+            s.processPlayQueue()
+          }
+        }
+      }
+    } catch {
+      log("[Play Queue Write Err] \(error.localizedDescription)")
+      streamingQueue.async { [weak self] in
+        self?.currentPlayProcess = nil
+        self?.isPlayingQueue = false
+        self?.processPlayQueue()
       }
     }
   }
@@ -394,8 +663,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     if let last = sentences.last {
       let lower = last.lowercased()
       let isIntro = lower.hasSuffix("：") || lower.hasSuffix(":") || 
-                    lower.contains("如下") || lower.contains("以下") ||
-                    lower.contains("如下所示") || lower.contains("请看")
+                    lower.hasSuffix("如下") || lower.hasSuffix("如下。") ||
+                    lower.hasSuffix("如下所示") || lower.hasSuffix("如下所示。") ||
+                    lower.hasSuffix("请看") || lower.hasSuffix("请看。")
       
       if isIntro {
         sentences.removeLast()
@@ -483,9 +753,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   private func playFullAudio(_ data: Data, text: String) {
-    let mp3Url = "/tmp/ocb_tts.mp3"
+    let isWav = data.count >= 4 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 // "RIFF"
+    let audioUrl = isWav ? "/tmp/ocb_tts.wav" : "/tmp/ocb_tts.mp3"
     do {
-      try data.write(to: URL(fileURLWithPath: mp3Url))
+      try data.write(to: URL(fileURLWithPath: audioUrl))
       
       // Update speaking status for VAD sync
       try? "sending".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
@@ -503,7 +774,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let playTask = Process()
         s.currentPlayProcess = playTask
         playTask.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
-        playTask.arguments = [mp3Url]
+        playTask.arguments = [audioUrl]
         try? playTask.run()
         playTask.waitUntilExit()
         s.currentPlayProcess = nil
@@ -794,18 +1065,28 @@ if __name__ == "__main__":
       }
     }
     
-    // Filter to only include media players and web browsers to avoid system daemons/recording tools
+    // Filter to only include explicit native media players to avoid false sleep assertion triggers from browsers/other apps
     var filteredPids = Set<Int>()
     for pid in pids {
       if let path = getProcessPath(for: pid) {
-        let isUserApp = path.contains("/Applications/") ||
-                        path.contains("Safari.app") ||
-                        path.contains("Google Chrome") ||
-                        path.contains("com.apple.WebKit.WebContent") ||
-                        path.contains("WebKit.WebContent") ||
-                        path.contains("Spotify") ||
-                        path.contains("Music.app")
-        if isUserApp {
+        let lowerPath = path.lowercased()
+        let isMediaPlayer = lowerPath.contains("music.app") ||
+                            lowerPath.contains("spotify") ||
+                            lowerPath.contains("iina") ||
+                            lowerPath.contains("vlc") ||
+                            lowerPath.contains("quicktime") ||
+                            lowerPath.contains("neteasemusic") ||
+                            lowerPath.contains("qqmusic") ||
+                            lowerPath.contains("tencentvideo") ||
+                            lowerPath.contains("youku") ||
+                            lowerPath.contains("iqiyi") ||
+                            lowerPath.contains("tiktok") ||
+                            lowerPath.contains("抖音") ||
+                            lowerPath.contains("腾讯视频") ||
+                            lowerPath.contains("爱奇艺") ||
+                            lowerPath.contains("优酷")
+                            
+        if isMediaPlayer {
           filteredPids.insert(pid)
         } else {
           log("[Media Filter] Ignored non-media PID: \(pid) (path: \(path))")
