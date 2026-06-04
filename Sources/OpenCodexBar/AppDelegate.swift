@@ -1130,26 +1130,6 @@ if __name__ == "__main__":
         self.didPauseMediaViaMediaRemote = false
     }
 
-    // Dynamic 0.5s media monitoring timer: if any sound-producing app starts playing mid-session, we issue a MediaRemote Pause command to pause it gracefully
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else { return }
-      self.mediaMonitoringTimer?.invalidate()
-      self.mediaMonitoringTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-        guard let self = self else { return }
-        let playingPids = self.getAudioPlayingPIDs()
-        let ourPid = Int(getpid())
-        let afplayPid = self.currentPlayProcess?.processIdentifier
-        let hasActivePlayback = playingPids.contains { pid in
-            return pid != ourPid && (afplayPid == nil || pid != Int(afplayPid!))
-        }
-        if hasActivePlayback {
-            self.log("[Media Monitor] Audio playback detected mid-session. Graceful pause sent via MediaRemote.")
-            self.sendMediaRemoteCommand(1) // Pause
-            self.didPauseMediaViaMediaRemote = true
-        }
-      }
-    }
-
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       
