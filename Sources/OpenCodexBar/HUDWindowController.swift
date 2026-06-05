@@ -8,6 +8,7 @@ class HUDWindow: NSWindow {
 
 class HUDWindowController: NSWindowController, WKNavigationDelegate {
   var webView: WKWebView!
+  private var hudSessionId = 0
 
   convenience init() {
     let width: CGFloat = 360
@@ -83,6 +84,7 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
 
   func showHUD() {
     guard let window = self.window else { return }
+    hudSessionId += 1
 
     let screen = NSScreen.main ?? NSScreen.screens.first
     let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
@@ -95,11 +97,13 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
       height: height
     )
     
-    var startFrame = finalFrame
-    startFrame.origin.y = screenFrame.origin.y + screenFrame.height
-
-    window.setFrame(startFrame, display: true)
-    window.alphaValue = 0.0
+    if !window.isVisible || window.alphaValue == 0.0 {
+      var startFrame = finalFrame
+      startFrame.origin.y = screenFrame.origin.y + screenFrame.height
+      window.setFrame(startFrame, display: true)
+      window.alphaValue = 0.0
+    }
+    
     window.invalidateShadow()
     window.orderFrontRegardless()
 
@@ -118,6 +122,8 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
       completion?()
       return
     }
+    hudSessionId += 1
+    let currentSession = hudSessionId
 
     let screen = NSScreen.main ?? NSScreen.screens.first
     let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
@@ -131,7 +137,8 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
       context.timingFunction = CAMediaTimingFunction(name: .easeIn)
       window.animator().alphaValue = 0.0
       window.animator().setFrame(targetFrame, display: true)
-    }) {
+    }) { [weak self] in
+      guard let self = self, self.hudSessionId == currentSession else { return }
       window.orderOut(nil)
       window.setFrame(currentFrame, display: false)
       completion?()

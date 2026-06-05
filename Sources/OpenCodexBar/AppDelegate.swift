@@ -2,6 +2,8 @@ import AppKit
 import Speech
 import AVFoundation
 import Carbon
+import ApplicationServices
+import Darwin
 
 class AppDelegate: NSObject, NSApplicationDelegate {
   static weak var shared: AppDelegate?
@@ -10,6 +12,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private let replyFile = "/tmp/voice_reply.txt"
   private let logFile = "/tmp/ocb_debug.log"
   private var sessionId: String?
+  private var lastQueryTime: Date?
   var hudWindowController: HUDWindowController?
   var notchDropZoneController: NotchDropZoneController?
   var isWaitingForDropCommand = false
@@ -17,6 +20,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private var currentDroppedFilePath: String?
   private var didPauseMediaViaMediaRemote = false
   private var speakingTimer: Timer?
+  private var pendingHideWorkItem: DispatchWorkItem?
   var currentAskProcess: Process?
   var currentPlayProcess: Process?
   private var ttsQueue: [String] = []
@@ -30,20 +34,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private var didPlayResponseChime = false
   private var streamResponseText = ""
   private var streamCurrentSentence = ""
-  private var streamHasHitStructuredLine = false
+  private var hasHitCodexResponsePrefix = false
   private var didSynthesizeAnySpeech = false
+  private var queryExecutedAnyTools = false
   private let streamingQueue = DispatchQueue(label: "com.opencodex.streaming")
   private var currentQuerySequence = 0
   private var nextSentenceIndex = 0
   private var nextPlayIndex = 0
   private var pendingAudioMap: [Int: (data: Data, text: String)] = [:]
   private var expectedSentenceCount: Int? = nil
+  private var streamProcessedCharCount = 0
+  private var streamInCodeBlock = false
 
   func log(_ m: String) {
     if let h = FileHandle(forWritingAtPath: logFile) {
       h.seekToEndOfFile()
       h.write((m + "\n").data(using: .utf8)!)
       h.closeFile()
+    }
+  }
+
+  private func requestSystemPermissions() {
+    log("[Permissions] Requesting system permissions...")
+    // 1. Request Accessibility Permission (triggers system authorization prompt if not trusted)
+    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+    let axTrusted = AXIsProcessTrustedWithOptions(options)
+    log("[Permissions] Accessibility trusted status: \(axTrusted)")
+
+    // 2. Request Screen Recording Permission (triggers system authorization prompt if not authorized)
+    if #available(macOS 10.15, *) {
+      let screenRecordingTrusted = CGPreflightScreenCaptureAccess()
+      log("[Permissions] Screen Recording preflight status: \(screenRecordingTrusted)")
+      if !screenRecordingTrusted {
+        CGRequestScreenCaptureAccess()
+      }
     }
   }
 
@@ -68,6 +92,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     try? "".write(toFile: logFile, atomically: true, encoding: .utf8)
     log("[App] Launch")
     
+    requestSystemPermissions()
     ensurePythonScripts()
     setupMainMenu()
     
@@ -172,6 +197,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     speakingTimer?.invalidate()
     speakingTimer = nil
     
+    pendingHideWorkItem?.cancel()
+    pendingHideWorkItem = nil
+    
     // Invalidate media monitoring timer
     mediaMonitoringTimer?.invalidate()
     mediaMonitoringTimer = nil
@@ -260,42 +288,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       return
     }
 
+    self.lastQueryTime = Date()
+
     log("[Go] \(text.prefix(30))")
     statusBar.setStatus(.sending)
     hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "Thinking...")
     try? text.write(toFile: "/tmp/voice_cmd.txt", atomically: true, encoding: .utf8)
 
-    let routedPrompt = """
-[User Request]
-\(text)
-
-[System Guidelines]
-1. Conversational Queries: If the request is a simple greeting, casual conversation, or informational question, answer directly in natural text.
-2. Coding/Terminal Queries: If the request is a pure coding, file-compilation, or command-line developer task, you may use the standard developer shell/terminal/file tools.
-3. System/App/GUI Operations: For ANY other operational task (e.g. opening/managing desktop applications, visiting websites, clicking, typing, scrolling, searching the web, interactive screen tasks), you MUST execute it immediately using the macOS "computer_use" GUI automation tools. You are strictly forbidden from using any high-level "browser" or "chrome" webbridge plugins. You MUST operate the actual screen via computer_use tools (e.g. opening Google Chrome using the mouse/keyboard, typing the URL on the screen, clicking actual coordinates, etc.). Do not write bash/apple-scripts or explain your plan. Act directly on the screen.
-- Tip: When clicking buttons like "Play/Pause" that may have a brief loading or animation delay, carefully check the next screenshot. If the button has changed (e.g., a Play triangle turns into a Pause double-bar), it has succeeded; do not click it again or attempt other fallback steps. Declare success and finish.
-4. Response Format for Voice TTS: Always start your response with a single, highly coherent, conversational spoken summary paragraph (strictly between 50 and 120 characters) optimized for direct TTS.
-- The first paragraph MUST be a high-level natural summary of your findings or results.
-- CRITICAL: You are strictly forbidden from listing raw items, trends, names, files, or specific lists in this first paragraph. For example, do NOT say "页面刷新成功，热门趋势有：第一是A，第二是B..." or read them out. Instead, say: "我已经为您刷新了页面并查看了热门趋势。今天的热点主要集中在科技与民生话题上，具体列表我已经为您整理在屏幕上了。"
-- You MUST leave a blank line (\n\n) right after this summary paragraph, and then place any raw tables, logs, list items, code blocks, or technical breakdowns below that blank line.
-"""
-
     // Reset streaming state before asking
     self.streamResponseText = ""
     self.streamCurrentSentence = ""
-    self.streamHasHitStructuredLine = false
+    self.hasHitCodexResponsePrefix = false
     self.didPlayResponseChime = false
     self.didSynthesizeAnySpeech = false
     self.nextSentenceIndex = 0
     self.nextPlayIndex = 0
     self.pendingAudioMap.removeAll()
     self.expectedSentenceCount = nil
+    self.streamProcessedCharCount = 0
+    self.queryExecutedAnyTools = false
+    self.streamInCodeBlock = false
 
-    ask(routedPrompt) { [weak self] reply in
-      guard let s = self else { return }
+    let activeSeq = self.currentQuerySequence
+    ask(text) { [weak self] reply in
+      guard let s = self, s.currentQuerySequence == activeSeq else { return }
       guard !reply.isEmpty else {
         s.log("[Empty]")
         DispatchQueue.main.async {
+          guard s.currentQuerySequence == activeSeq else { return }
           s.statusBar.setStatus(.idle)
           s.hudWindowController?.hideHUD { [weak s] in
             s?.resumeSystemMedia()
@@ -304,14 +324,90 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return
       }
       
-      let c = s.clean(reply)
-      s.log("[LLM Done] Output text written to file. VAD summary speaking is already streaming.")
+      let finalReply = s.extractFinalCodexResponse(reply) ?? ""
+      let c = s.clean(finalReply)
+      s.log("[LLM Done] Output text written to file. Speaking final summary.")
       try? c.write(toFile: s.replyFile, atomically: true, encoding: .utf8)
 
-      DispatchQueue.main.async {
-        s.statusBar.setStatus(.idle)
+      // Scan full reply for tool executions to be robust
+      let lines = reply.components(separatedBy: .newlines)
+      for line in lines {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed.hasPrefix("mcp:") || trimmed.hasPrefix("exec") {
+          s.queryExecutedAnyTools = true
+          break
+        }
+      }
+
+      s.streamingQueue.async {
+        guard s.currentQuerySequence == activeSeq else { return }
+        
+        if !s.hasHitCodexResponsePrefix {
+          if let finalReply = s.extractFinalCodexResponse(reply) {
+            let cleaned = s.clean(finalReply)
+            if !cleaned.isEmpty {
+              s.log("[Stream TTS Fallback] No codex prefix in stream, but final reply is present. Speaking final reply.")
+              DispatchQueue.main.async {
+                guard s.currentQuerySequence == activeSeq else { return }
+                s.tts(cleaned)
+              }
+              return
+            }
+          }
+          
+          s.log("[Stream TTS Fallback] No codex prefix found in stream and no final reply. Speaking error fallback.")
+          DispatchQueue.main.async {
+            guard s.currentQuerySequence == activeSeq else { return }
+            s.tts("抱歉，我暂时未能生成回复，请查看屏幕或重试。")
+          }
+          return
+        }
+        
+        // Flush any remaining characters in streamCurrentSentence
+        let finalSentence = s.clean(s.streamCurrentSentence)
+        if !finalSentence.isEmpty {
+          let cleanedTail = s.cleanIntroductoryTail(finalSentence)
+          if !cleanedTail.isEmpty {
+            let idx = s.nextSentenceIndex
+            s.nextSentenceIndex += 1
+            s.synthesizeSentence(cleanedTail, index: idx, querySeq: activeSeq)
+          }
+        }
+        s.expectedSentenceCount = s.nextSentenceIndex
+        s.processPlayQueue()
       }
     }
+  }
+
+  private func openPty() -> (master: FileHandle, slave: FileHandle)? {
+    var masterFd: Int32 = 0
+    masterFd = posix_openpt(O_RDWR | O_NOCTTY)
+    guard masterFd >= 0 else { return nil }
+    guard grantpt(masterFd) == 0 else {
+      close(masterFd)
+      return nil
+    }
+    guard unlockpt(masterFd) == 0 else {
+      close(masterFd)
+      return nil
+    }
+    guard let ptsName = ptsname(masterFd) else {
+      close(masterFd)
+      return nil
+    }
+    let slaveFd = open(ptsName, O_RDWR | O_NOCTTY)
+    guard slaveFd >= 0 else {
+      close(masterFd)
+      return nil
+    }
+    var t = termios()
+    if tcgetattr(slaveFd, &t) == 0 {
+      t.c_lflag &= ~tcflag_t(ECHO)
+      tcsetattr(slaveFd, TCSANOW, &t)
+    }
+    let masterHandle = FileHandle(fileDescriptor: masterFd, closeOnDealloc: true)
+    let slaveHandle = FileHandle(fileDescriptor: slaveFd, closeOnDealloc: true)
+    return (masterHandle, slaveHandle)
   }
 
   private func ask(_ prompt: String, cb: @escaping (String) -> Void) {
@@ -325,110 +421,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       
       let task = Process()
       self.currentAskProcess = task
+      DispatchQueue.main.async {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+      }
       task.executableURL = URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex")
 
       var env = ProcessInfo.processInfo.environment
-      let customPath = "/opt/homebrew/bin:/usr/local/bin"
+      let localBin = "\(NSHomeDirectory())/.gemini/antigravity/bin"
+      let customPath = "\(localBin):/opt/homebrew/bin:/usr/local/bin"
       if let currentPath = env["PATH"] {
         env["PATH"] = "\(customPath):\(currentPath)"
       } else {
         env["PATH"] = customPath
       }
       task.environment = env
+
       task.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
 
-      var args = ["--dangerously-bypass-approvals-and-sandbox", "exec"]
       let settings = VoiceSettings.load()
+      var args = [
+        "--dangerously-bypass-approvals-and-sandbox",
+        "exec"
+      ]
       if let model = settings.voice_llm_model, !model.isEmpty {
-        args += ["--model", model]
+        args.append(contentsOf: ["--model", model])
       }
       if let sid = self.sessionId {
-        args += ["resume", sid]
+        args.append(contentsOf: ["resume", sid])
       }
-      args += ["--skip-git-repo-check", "-"]
+      args.append(contentsOf: ["--skip-git-repo-check", "-"])
       task.arguments = args
 
-      let outPipe = Pipe()
-      let errPipe = Pipe()
-      let inPipe = Pipe()
-      task.standardOutput = outPipe
-      task.standardError = errPipe
-      task.standardInput = inPipe
+      guard let pty = self.openPty() else {
+        self.log("[PTY Err] Failed to create PTY")
+        cb("[错误]")
+        return
+      }
+      task.standardInput = pty.slave
+      task.standardOutput = pty.slave
+      task.standardError = pty.slave
 
       let sem = DispatchSemaphore(value: 0)
       var errData = Data()
       let errQueue = DispatchQueue(label: "com.opencodex.err")
       
-      task.terminationHandler = { [weak self] _ in
-        guard let self = self else {
+      task.terminationHandler = { _ in
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+          pty.master.readabilityHandler = nil
           sem.signal()
-          return
         }
-        
-        outPipe.fileHandleForReading.readabilityHandler = nil
-        errPipe.fileHandleForReading.readabilityHandler = nil
-        
-        let activeSeq = self.currentQuerySequence
-        self.streamingQueue.async { [weak self] in
-          guard let self = self else { return }
-          if self.currentQuerySequence != activeSeq {
-            return
-          }
-          let remaining = self.streamCurrentSentence.trimmingCharacters(in: .whitespacesAndNewlines)
-          self.streamCurrentSentence = ""
-          
-          if !remaining.isEmpty && !self.streamHasHitStructuredLine && !self.isStructuredLine(remaining) {
-            let cleaned = self.cleanIntroductoryTail(remaining)
-            let finalCleaned = self.clean(cleaned).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !finalCleaned.isEmpty {
-              self.log("[Stream TTS Final] Sending remaining: '\(finalCleaned)'")
-              self.didSynthesizeAnySpeech = true
-              let currentIdx = self.nextSentenceIndex
-              self.nextSentenceIndex += 1
-              self.synthesizeFullReply(finalCleaned) { [weak self] audioData in
-                guard let self = self else { return }
-                if self.currentQuerySequence == activeSeq {
-                  self.queueAudio(audioData, text: finalCleaned, index: currentIdx)
-                }
-              }
-            }
-          }
-          
-          if !self.didSynthesizeAnySpeech {
-            let fallback = "我已经为您整理好了，请在屏幕上查看具体内容。"
-            self.log("[Stream TTS Fallback] Sending default text")
-            self.didSynthesizeAnySpeech = true
-            let currentIdx = self.nextSentenceIndex
-            self.nextSentenceIndex += 1
-            self.synthesizeFullReply(fallback) { [weak self] audioData in
-              guard let self = self else { return }
-              if self.currentQuerySequence == activeSeq {
-                self.queueAudio(audioData, text: fallback, index: currentIdx)
-              }
-            }
-          }
-          
-          self.expectedSentenceCount = self.nextSentenceIndex
-          self.processPlayQueue()
-        }
-        
-        sem.signal()
       }
 
       do {
-        outPipe.fileHandleForReading.readabilityHandler = { [weak self] fileHandle in
+        pty.master.readabilityHandler = { [weak self] fileHandle in
           guard let self = self else { return }
           let data = fileHandle.availableData
           if data.isEmpty { return }
           if let chunk = String(data: data, encoding: .utf8) {
             let activeSeq = self.currentQuerySequence
             self.processStreamingChunk(chunk, querySeq: activeSeq)
-          }
-        }
-
-        errPipe.fileHandleForReading.readabilityHandler = { fileHandle in
-          let data = fileHandle.availableData
-          if !data.isEmpty {
             errQueue.async {
               errData.append(data)
             }
@@ -436,35 +487,66 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         try task.run()
-        inPipe.fileHandleForWriting.write((prompt + "\n").data(using: .utf8)!)
-        try inPipe.fileHandleForWriting.close()
+        pty.master.write((prompt + "\n").data(using: .utf8)!)
+        pty.master.write(Data([4])) // Send Ctrl-D (EOF) to stdin
 
         sem.wait()
         self.currentAskProcess = nil
 
-        if self.sessionId == nil {
-          let errStr = String(data: errData, encoding: .utf8) ?? ""
-          if let r = errStr.range(of: "session id: ([\\w-]+)", options: .regularExpression) {
-            self.sessionId = String(errStr[r])
-              .replacingOccurrences(of: "session id: ", with: "")
-              .trimmingCharacters(in: .whitespaces)
-            self.log("[SID] \(self.sessionId!)")
+        var errStr = String(data: errData, encoding: .utf8) ?? ""
+        errStr = errStr.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
+        if let r = errStr.range(of: "session id: ([\\w-]+)", options: .regularExpression) {
+          let parsedSid = String(errStr[r])
+            .replacingOccurrences(of: "session id: ", with: "")
+            .trimmingCharacters(in: .whitespaces)
+          if self.sessionId != parsedSid {
+            self.sessionId = parsedSid
+            self.log("[SID] Updated to Session ID: \(parsedSid)")
           }
+        } else if errStr.lowercased().contains("session") && (errStr.lowercased().contains("not found") || errStr.lowercased().contains("invalid") || errStr.lowercased().contains("expired")) {
+          self.sessionId = nil
+          self.log("[SID] Session invalid or not found, cleared local session ID")
         }
 
-        var output = self.streamResponseText
-        output = output.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
-        output = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.log("[Resp] \(output.prefix(80))")
-        DispatchQueue.main.async { cb(output) }
+        self.streamingQueue.async {
+          var output = self.streamResponseText
+          output = output.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
+          output = output.trimmingCharacters(in: .whitespacesAndNewlines)
+          self.log("[Resp] \(output.prefix(80))")
+          DispatchQueue.main.async { cb(output) }
+        }
       } catch {
         self.currentAskProcess = nil
-        outPipe.fileHandleForReading.readabilityHandler = nil
-        errPipe.fileHandleForReading.readabilityHandler = nil
+        pty.master.readabilityHandler = nil
         self.log("[Ask Err] \(error.localizedDescription)")
         DispatchQueue.main.async { cb("[错误]") }
       }
     }
+  }
+
+  private func isCodexHeader(_ line: String) -> Bool {
+    let lower = line.lowercased()
+    return lower == "codex" || lower.hasPrefix("codex:") || lower.hasPrefix("codex ")
+  }
+
+  private func isOtherBlockHeader(_ line: String) -> Bool {
+    let lower = line.lowercased()
+    if lower.hasPrefix("mcp:") || lower.hasPrefix("exec") || lower.hasPrefix("user") {
+      return true
+    }
+    if lower.hasPrefix("--------") ||
+       lower.hasPrefix("openai codex") ||
+       lower.hasPrefix("workdir:") ||
+       lower.hasPrefix("model:") ||
+       lower.hasPrefix("provider:") ||
+       lower.hasPrefix("approval:") ||
+       lower.hasPrefix("sandbox:") ||
+       lower.hasPrefix("reasoning effort:") ||
+       lower.hasPrefix("reasoning summaries:") ||
+       lower.hasPrefix("session id:") {
+      return true
+    }
+    return false
   }
 
   private func processStreamingChunk(_ chunk: String, querySeq: Int) {
@@ -473,45 +555,165 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       if self.currentQuerySequence != querySeq {
         return
       }
+      self.log("[Stream Chunk] '\(chunk)'")
       self.streamResponseText += chunk
       
-      if self.streamHasHitStructuredLine {
-        return
-      }
+      let cleanText = self.streamResponseText.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
+      let lines = cleanText.components(separatedBy: .newlines)
       
-      for char in chunk {
-        self.streamCurrentSentence.append(char)
-        
-        if char == "。" || char == "！" || char == "？" || char == "!" || char == "?" || char == "\n" {
-          let sentence = self.streamCurrentSentence.trimmingCharacters(in: .whitespacesAndNewlines)
-          self.streamCurrentSentence = ""
-          
-          if !sentence.isEmpty {
-            if self.isStructuredLine(sentence) {
-              self.streamHasHitStructuredLine = true
-              return
-            }
-            
-            let cleaned = self.cleanIntroductoryTail(sentence)
-            let finalCleaned = self.clean(cleaned).trimmingCharacters(in: .whitespacesAndNewlines)
-            
-            if !finalCleaned.isEmpty {
-              self.log("[Stream TTS] Sending sentence: '\(finalCleaned)'")
-              self.didSynthesizeAnySpeech = true
-              let currentIdx = self.nextSentenceIndex
-              self.nextSentenceIndex += 1
-              self.synthesizeFullReply(finalCleaned) { [weak self] audioData in
-                guard let self = self else { return }
-                if self.currentQuerySequence == querySeq {
-                  self.queueAudio(audioData, text: finalCleaned, index: currentIdx)
-                } else {
-                  self.log("[Stream TTS] Discarding stale audio for sentence: '\(finalCleaned)'")
-                }
-              }
-            }
+      var spokenLines = [String]()
+      var currentBlockTypeIsCodex = false
+      
+      for i in 0..<lines.count {
+        let line = lines[i].trimmingCharacters(in: .whitespacesAndNewlines)
+        if self.isCodexHeader(line) {
+          currentBlockTypeIsCodex = true
+          self.hasHitCodexResponsePrefix = true
+        } else if self.isOtherBlockHeader(line) {
+          currentBlockTypeIsCodex = false
+          let lower = line.lowercased()
+          if lower.hasPrefix("mcp:") || lower.hasPrefix("exec") {
+            self.queryExecutedAnyTools = true
           }
+        } else if currentBlockTypeIsCodex {
+          spokenLines.append(lines[i])
         }
       }
+      
+      let spokenStream = spokenLines.joined(separator: "\n")
+      self.parseAndQueueSentences(spokenStream, querySeq: querySeq)
+    }
+  }
+
+  private func getLine(at index: Int, in chars: [Character]) -> (line: String, endIndex: Int) {
+    var line = ""
+    var idx = index
+    let totalCount = chars.count
+    while idx < totalCount {
+      let c = chars[idx]
+      if c == "\n" || c == "\r" {
+        break
+      }
+      line.append(c)
+      idx += 1
+    }
+    return (line, idx)
+  }
+
+  private func isUnspeakableLine(_ line: String) -> Bool {
+    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("```") ||
+       trimmed.hasPrefix("|") ||
+       trimmed.hasPrefix("$ ") ||
+       trimmed.hasPrefix("% ") ||
+       trimmed.hasPrefix("---") {
+      return true
+    }
+    return false
+  }
+
+  private func parseAndQueueSentences(_ text: String, querySeq: Int) {
+    let chars = Array(text)
+    let totalCount = chars.count
+    
+    while streamProcessedCharCount < totalCount {
+      // Check if we are at the start of a line
+      let isStartOfLine = (streamProcessedCharCount == 0) || 
+                          (chars[streamProcessedCharCount - 1] == "\n" || chars[streamProcessedCharCount - 1] == "\r")
+      
+      if isStartOfLine {
+        let (currentLine, endIndex) = self.getLine(at: streamProcessedCharCount, in: chars)
+        let trimmed = currentLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // Check code block toggle
+        if trimmed.hasPrefix("```") {
+          self.streamInCodeBlock = !self.streamInCodeBlock
+          self.log("[Stream TTS] Code block toggle: streamInCodeBlock = \(self.streamInCodeBlock) (line: '\(trimmed)')")
+          
+          // Flush the current buffer before skipping/toggling
+          let sentence = self.clean(streamCurrentSentence)
+          if !sentence.isEmpty {
+            let cleanedSentence = self.cleanIntroductoryTail(sentence)
+            if !cleanedSentence.isEmpty {
+              let index = nextSentenceIndex
+              nextSentenceIndex += 1
+              synthesizeSentence(cleanedSentence, index: index, querySeq: querySeq)
+            }
+            streamCurrentSentence = ""
+          }
+          
+          // Skip the entire line (including the code block marker)
+          streamProcessedCharCount = endIndex
+          continue
+        }
+        
+        // If we are currently inside a code block, or if this line is unspeakable
+        if self.streamInCodeBlock || self.isUnspeakableLine(trimmed) {
+          self.log("[Stream TTS] Skipping line (inCodeBlock: \(self.streamInCodeBlock), unspeakable: \(self.isUnspeakableLine(trimmed))): '\(trimmed)'")
+          
+          // Flush the current buffer before skipping
+          let sentence = self.clean(streamCurrentSentence)
+          if !sentence.isEmpty {
+            let cleanedSentence = self.cleanIntroductoryTail(sentence)
+            if !cleanedSentence.isEmpty {
+              let index = nextSentenceIndex
+              nextSentenceIndex += 1
+              synthesizeSentence(cleanedSentence, index: index, querySeq: querySeq)
+            }
+            streamCurrentSentence = ""
+          }
+          
+          // Skip the entire line
+          streamProcessedCharCount = endIndex
+          continue
+        }
+      }
+      
+      let char = chars[streamProcessedCharCount]
+      
+      if char == "\n" || char == "\r" {
+        // Skip double processing of CRLF
+        if char == "\r" && streamProcessedCharCount + 1 < totalCount && chars[streamProcessedCharCount + 1] == "\n" {
+          streamProcessedCharCount += 1 // Advance past \r, the \n will handle it
+        }
+        
+        let sentence = self.clean(streamCurrentSentence)
+        if !sentence.isEmpty {
+          if isIntroductorySentence(sentence) {
+            // Keep introductory sentence in buffer to see if it is followed by structured content
+          } else {
+            let index = nextSentenceIndex
+            nextSentenceIndex += 1
+            synthesizeSentence(sentence, index: index, querySeq: querySeq)
+            streamCurrentSentence = ""
+          }
+        }
+      } else if char == "。" || char == "！" || char == "？" || char == "!" || char == "?" || char == "；" || char == ";" {
+        streamCurrentSentence.append(char)
+        let sentence = self.clean(streamCurrentSentence)
+        if !sentence.isEmpty {
+          if isIntroductorySentence(sentence) {
+            // Keep in buffer
+          } else {
+            let index = nextSentenceIndex
+            nextSentenceIndex += 1
+            synthesizeSentence(sentence, index: index, querySeq: querySeq)
+            streamCurrentSentence = ""
+          }
+        }
+      } else {
+        streamCurrentSentence.append(char)
+      }
+      
+      streamProcessedCharCount += 1
+    }
+  }
+
+  private func synthesizeSentence(_ text: String, index: Int, querySeq: Int) {
+    self.log("[Stream TTS] Synthesizing sentence \(index): '\(text)'")
+    synthesizeFullReply(text) { [weak self] audioData in
+      guard let s = self, s.currentQuerySequence == querySeq else { return }
+      s.queueAudio(audioData, text: text, index: index)
     }
   }
 
@@ -531,7 +733,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     if let expected = expectedSentenceCount, nextPlayIndex >= expected {
       try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
       DispatchQueue.main.async { [weak self] in
-        self?.stopSpeakingAnimation()
+        guard let self = self else { return }
+        self.statusBar.setStatus(.idle)
+        self.stopSpeakingAnimation()
       }
       return
     }
@@ -548,11 +752,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   private func playNextQueueItem() {
+    let activeSeq = self.currentQuerySequence
     guard !playQueue.isEmpty else {
       isPlayingQueue = false
       try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
       DispatchQueue.main.async { [weak self] in
-        self?.stopSpeakingAnimation()
+        guard let self = self, self.currentQuerySequence == activeSeq else { return }
+        self.statusBar.setStatus(.idle)
+        self.stopSpeakingAnimation()
       }
       return
     }
@@ -573,7 +780,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       try? "sending".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
       
       DispatchQueue.main.async { [weak self] in
-        guard let self = self else { return }
+        guard let self = self, self.currentQuerySequence == activeSeq else { return }
         // Play response chime only once per query
         if !self.didPlayResponseChime {
           self.didPlayResponseChime = true
@@ -591,19 +798,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         s.currentPlayProcess = p
         p.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
         p.arguments = [chunkFile]
-        p.terminationHandler = { [weak s] _ in
+        p.terminationHandler = { [weak self] _ in
           try? FileManager.default.removeItem(atPath: chunkFile)
-          s?.streamingQueue.async {
-            s?.currentPlayProcess = nil
-            s?.isPlayingQueue = false
-            s?.processPlayQueue()
+          self?.streamingQueue.async {
+            guard let s = self, s.currentQuerySequence == activeSeq else { return }
+            s.currentPlayProcess = nil
+            s.isPlayingQueue = false
+            s.processPlayQueue()
           }
         }
         do {
           try p.run()
         } catch {
           s.log("[Play Queue Err] \(error.localizedDescription)")
-          s.streamingQueue.async {
+          s.streamingQueue.async { [weak self] in
+            guard let s = self, s.currentQuerySequence == activeSeq else { return }
             s.currentPlayProcess = nil
             s.isPlayingQueue = false
             s.processPlayQueue()
@@ -613,101 +822,74 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     } catch {
       log("[Play Queue Write Err] \(error.localizedDescription)")
       streamingQueue.async { [weak self] in
-        self?.currentPlayProcess = nil
-        self?.isPlayingQueue = false
-        self?.processPlayQueue()
+        guard let self = self, self.currentQuerySequence == activeSeq else { return }
+        self.currentPlayProcess = nil
+        self.isPlayingQueue = false
+        self.processPlayQueue()
       }
     }
   }
 
-  private func isStructuredLine(_ line: String) -> Bool {
-    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmed.hasPrefix("```") || trimmed.hasPrefix("|") || trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") || trimmed.hasPrefix("$ ") || trimmed.hasPrefix("% ") {
+
+
+  private func isIntroductorySentence(_ text: String) -> Bool {
+    let cleaned = clean(text)
+    let lower = cleaned.lowercased()
+    
+    if lower.hasSuffix("：") || lower.hasSuffix(":") ||
+       lower.hasSuffix("如下") || lower.hasSuffix("如下所示") ||
+       lower.hasSuffix("请看") || lower.hasSuffix("比如") ||
+       lower.hasSuffix("例如") || lower.hasSuffix("如下：") ||
+       lower.hasSuffix("如下:") {
       return true
-    }
-    if trimmed.hasPrefix("• ") || trimmed.hasPrefix("◦ ") || trimmed.hasPrefix("▪ ") {
-      return true
-    }
-    if let regex = try? NSRegularExpression(pattern: "^[0-9]+[.\\)]\\s", options: []) {
-      let range = NSRange(location: 0, length: trimmed.utf16.count)
-      if regex.firstMatch(in: trimmed, options: [], range: range) != nil {
-        return true
-      }
     }
     return false
   }
 
-  private func cleanIntroductoryTail(_ text: String) -> String {
-    var sentences = [String]()
-    var current = ""
+  private func stripIntroductoryTail(_ text: String) -> String {
+    var result = clean(text)
+    let suffixList = [
+      "如下所示：", "如下所示:", "如下所示。", "如下所示",
+      "如下：", "如下:", "如下。", "如下",
+      "步骤如下：", "步骤如下:", "步骤如下",
+      "操作步骤如下：", "操作步骤如下:", "操作步骤如下",
+      "以下是操作步骤：", "以下是操作步骤",
+      "具体步骤如下：", "具体步骤如下:", "具体步骤如下",
+      "请看：", "请看:", "请看。", "请看",
+      "比如：", "比如:", "比如。", "比如",
+      "例如：", "例如:", "例如。", "例如",
+      "具体内容：", "具体内容:", "具体内容",
+      "操作步骤：", "操作步骤:", "操作步骤",
+      "内容如下：", "内容如下:", "内容如下",
+      "：", ":"
+    ]
     
-    for char in text {
-      current.append(char)
-      if char == "。" || char == "！" || char == "？" || char == "!" || char == "?" || char == "\n" {
-        let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-          sentences.append(trimmed)
+    var changed = true
+    while changed {
+      changed = false
+      for suffix in suffixList {
+        if result.lowercased().hasSuffix(suffix) {
+          let len = suffix.count
+          result = String(result.dropLast(len)).trimmingCharacters(in: .whitespacesAndNewlines)
+          if result.hasSuffix("，") || result.hasSuffix(",") {
+            result = String(result.dropLast(1)).trimmingCharacters(in: .whitespacesAndNewlines)
+          }
+          changed = true
+          break
         }
-        current = ""
       }
     }
-    
-    let trimmedLast = current.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !trimmedLast.isEmpty {
-      sentences.append(trimmedLast)
-    }
-    
-    if sentences.isEmpty {
-      return ""
-    }
-    
-    if let last = sentences.last {
-      let lower = last.lowercased()
-      let isIntro = lower.hasSuffix("：") || lower.hasSuffix(":") || 
-                    lower.hasSuffix("如下") || lower.hasSuffix("如下。") ||
-                    lower.hasSuffix("如下所示") || lower.hasSuffix("如下所示。") ||
-                    lower.hasSuffix("请看") || lower.hasSuffix("请看。")
-      
-      if isIntro {
-        sentences.removeLast()
-      }
-    }
-    
-    return sentences.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    return result
   }
 
-  private func extractSpokenSummary(_ t: String) -> String {
-    let lines = t.components(separatedBy: "\n")
-    var collected = [String]()
-    
-    for line in lines {
-      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-      if trimmed.isEmpty {
-        continue
-      }
-      
-      if isStructuredLine(trimmed) {
-        break
-      }
-      
-      collected.append(trimmed)
-    }
-    
-    let joined = collected.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-    let result = cleanIntroductoryTail(joined)
-    
-    if !result.isEmpty {
-      return result
-    }
-    
-    return "我已经为您整理好了，请在屏幕上查看具体内容。"
+  private func cleanIntroductoryTail(_ text: String) -> String {
+    return stripIntroductoryTail(text)
   }
 
   private func tts(_ t: String) {
     cancelActiveVoiceOperations()
     
-    let spokenText = extractSpokenSummary(t)
-    let cleaned = clean(spokenText)
+    let cleaned = clean(t)
     var shortText = cleaned
     shortText = shortText.trimmingCharacters(in: .whitespacesAndNewlines)
     
@@ -723,10 +905,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       }
     }
     
-    log("[TTS] Synthesizing spoken summary: '\(shortText.prefix(30))...'")
+    log("[TTS] Synthesizing: '\(shortText.prefix(30))...'")
     
+    let activeSeq = self.currentQuerySequence
     synthesizeFullReply(shortText) { [weak self] audioData in
-      guard let s = self else { return }
+      guard let s = self, s.currentQuerySequence == activeSeq else { return }
       s.playFullAudio(audioData, text: shortText)
     }
   }
@@ -754,6 +937,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   private func playFullAudio(_ data: Data, text: String) {
+    let activeSeq = self.currentQuerySequence
     let isWav = data.count >= 4 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 // "RIFF"
     let audioUrl = isWav ? "/tmp/ocb_tts.wav" : "/tmp/ocb_tts.mp3"
     do {
@@ -763,7 +947,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       try? "sending".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
       
       DispatchQueue.main.async { [weak self] in
-        self?.startSpeakingAnimation(text: text)
+        guard let s = self, s.currentQuerySequence == activeSeq else { return }
+        s.statusBar.setStatus(.idle)
+        s.startSpeakingAnimation(text: text)
       }
       
       DispatchQueue.global().async { [weak self] in
@@ -778,19 +964,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         playTask.arguments = [audioUrl]
         try? playTask.run()
         playTask.waitUntilExit()
-        s.currentPlayProcess = nil
         
         s.log("[TTS] Finished playing full audio")
         try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
         
         DispatchQueue.main.async {
+          guard s.currentQuerySequence == activeSeq else { return }
+          s.currentPlayProcess = nil
           s.stopSpeakingAnimation()
         }
       }
     } catch {
       self.log("[TTS Err] Failed to write/play audio: \(error.localizedDescription)")
       DispatchQueue.main.async { [weak self] in
-        self?.stopSpeakingAnimation()
+        guard let s = self, s.currentQuerySequence == activeSeq else { return }
+        s.stopSpeakingAnimation()
       }
     }
   }
@@ -811,12 +999,119 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     return "alloy"
   }
 
+  private func cleanListMarkers(_ line: String) -> String {
+    var trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    
+    // Strip leading blockquotes
+    while trimmed.hasPrefix(">") {
+      trimmed = String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)
+    }
+    
+    // Strip leading markdown headers (e.g., #, ##, ###)
+    while trimmed.hasPrefix("#") {
+      trimmed = String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)
+    }
+    
+    if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") || trimmed.hasPrefix("• ") {
+      trimmed = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+    } else if trimmed.hasPrefix("-") || trimmed.hasPrefix("*") || trimmed.hasPrefix("+") || trimmed.hasPrefix("•") {
+      trimmed = String(trimmed.dropFirst(1)).trimmingCharacters(in: .whitespaces)
+    }
+    
+    if let regex = try? NSRegularExpression(pattern: "^[0-9]+[\\.\\s、]+"),
+       let match = regex.firstMatch(in: trimmed, options: [], range: NSRange(location: 0, length: trimmed.utf16.count)) {
+      trimmed = String(trimmed.suffix(from: trimmed.index(trimmed.startIndex, offsetBy: match.range.length))).trimmingCharacters(in: .whitespaces)
+    }
+    
+    return trimmed
+  }
+
   private func clean(_ t: String) -> String {
     var r = t
     r = r.replacingOccurrences(of: "[\\p{So}\\p{Sk}]", with: "", options: .regularExpression)
     r = r.replacingOccurrences(of: "**", with: "")
     r = r.replacingOccurrences(of: "*", with: "")
+    r = r.replacingOccurrences(of: "`", with: "")
+    
+    let lines = r.components(separatedBy: .newlines)
+    var cleanedLines = [String]()
+    for line in lines {
+      let cleaned = cleanListMarkers(line)
+      if !cleaned.isEmpty {
+        cleanedLines.append(cleaned)
+      }
+    }
+    r = cleanedLines.joined(separator: "\n")
     return r.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private func stripTerminalHeader(_ text: String) -> String {
+    let lines = text.components(separatedBy: .newlines)
+    var dividerCount = 0
+    var headerEndIndex = -1
+    
+    for i in 0..<lines.count {
+      let line = lines[i].trimmingCharacters(in: .whitespacesAndNewlines)
+      if line.hasPrefix("--------") {
+        dividerCount += 1
+        if dividerCount == 2 {
+          headerEndIndex = i
+          break
+        }
+      }
+    }
+    
+    if headerEndIndex != -1 && headerEndIndex + 1 < lines.count {
+      var contentStartIndex = headerEndIndex + 1
+      while contentStartIndex < lines.count {
+        let line = lines[contentStartIndex].trimmingCharacters(in: .whitespacesAndNewlines)
+        if line.lowercased() == "user" {
+          contentStartIndex += 1
+          while contentStartIndex < lines.count {
+            let nextLine = lines[contentStartIndex].trimmingCharacters(in: .whitespacesAndNewlines)
+            if nextLine.isEmpty {
+              contentStartIndex += 1
+              break
+            }
+            contentStartIndex += 1
+          }
+          break
+        }
+        contentStartIndex += 1
+      }
+      if contentStartIndex < lines.count {
+        return lines[contentStartIndex...].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+      }
+    }
+    
+    return text
+  }
+
+  private func extractFinalCodexResponse(_ t: String) -> String? {
+    let cleanText = t.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
+    let stripped = stripTerminalHeader(cleanText)
+    
+    // Split by newlines (handles both \n and \r\n)
+    let lines = stripped.components(separatedBy: .newlines)
+    
+    for i in (0..<lines.count).reversed() {
+      let line = lines[i].trimmingCharacters(in: .whitespacesAndNewlines)
+      let lower = line.lowercased()
+      if lower == "codex" || lower.hasPrefix("codex:") || lower.hasPrefix("codex ") {
+        let responseLines = lines[(i + 1)...]
+        var response = responseLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if response.isEmpty {
+          let markerLength = lower.hasPrefix("codex:") ? 6 : 6
+          response = String(line.dropFirst(markerLength)).trimmingCharacters(in: .whitespacesAndNewlines)
+          if response.hasPrefix(":") {
+            response = response.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+          }
+        }
+        return response
+      }
+    }
+    
+    return nil
   }
 
   func startSpeakingAnimation(text: String) {
@@ -844,7 +1139,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       return
     }
     
-    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+    pendingHideWorkItem?.cancel()
+    let workItem = DispatchWorkItem { [weak self] in
       guard let self = self else { return }
       if self.voiceManager.isListening == false && self.speakingTimer == nil {
         self.hudWindowController?.hideHUD { [weak self] in
@@ -852,6 +1148,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
       }
     }
+    self.pendingHideWorkItem = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: workItem)
   }
 
   private func ensurePythonScripts() {
@@ -1117,25 +1415,22 @@ if __name__ == "__main__":
   }
 
   private func pauseSystemMedia() {
-    let playingPids = self.getAudioPlayingPIDs()
-    let ourPid = Int(getpid())
-    let afplayPid = self.currentPlayProcess?.processIdentifier
-    let hasActivePlayback = playingPids.contains { pid in
-        return pid != ourPid && (afplayPid == nil || pid != Int(afplayPid!))
-    }
-    
-    if hasActivePlayback {
-        self.didPauseMediaViaMediaRemote = true
-        self.log("[Media] Active audio playback detected. Will issue MediaRemote Pause.")
-    } else {
-        self.didPauseMediaViaMediaRemote = false
-    }
-
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       
-      if self.didPauseMediaViaMediaRemote {
+      let playingPids = self.getAudioPlayingPIDs()
+      let ourPid = Int(getpid())
+      let afplayPid = self.currentPlayProcess?.processIdentifier
+      let hasActivePlayback = playingPids.contains { pid in
+          return pid != ourPid && (afplayPid == nil || pid != Int(afplayPid!))
+      }
+      
+      if hasActivePlayback {
+          self.didPauseMediaViaMediaRemote = true
+          self.log("[Media] Active audio playback detected. Will issue MediaRemote Pause.")
           self.sendMediaRemoteCommand(1) // Pause
+      } else {
+          self.didPauseMediaViaMediaRemote = false
       }
       
       // Execute AppleScript to pause active browser video/audio elements (Safari, Chrome)
