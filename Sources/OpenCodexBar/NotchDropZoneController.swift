@@ -10,19 +10,14 @@ class DropZoneView: NSView {
     var onDragExited: (() -> Void)?
     var onPerformDrop: (([URL]) -> Void)?
     
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        registerForDraggedTypes([.fileURL])
-    }
-    
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
     override func hitTest(_ point: NSPoint) -> NSView? {
-        // Return nil to ensure that all standard clicks and mouse movements pass through
-        // to underlying menu items or desktop icons.
-        return nil
+        // Return nil on standard click events so that clicks pass through to underlying elements
+        if let event = NSApp.currentEvent {
+            if event.type == .leftMouseDown || event.type == .rightMouseDown || event.type == .otherMouseDown {
+                return nil
+            }
+        }
+        return self
     }
     
     // NSDraggingDestination protocols
@@ -37,11 +32,47 @@ class DropZoneView: NSView {
     
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         let pasteboard = sender.draggingPasteboard
-        guard let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty else {
-            return false
+        
+        // 1. Local files
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
+            let fileURLs = urls.filter { $0.isFileURL }
+            if !fileURLs.isEmpty {
+                onPerformDrop?(fileURLs)
+                return true
+            }
         }
-        onPerformDrop?(urls)
-        return true
+        
+        // 2. Dragged image data (TIFF/PNG from screenshots, web, etc.)
+        if let imgData = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
+            let tempURL = URL(fileURLWithPath: "/tmp/dropped_file.png")
+            if let image = NSImage(data: imgData) {
+                if let tiffData = image.tiffRepresentation,
+                   let bitmap = NSBitmapImageRep(data: tiffData),
+                   let pngData = bitmap.representation(using: .png, properties: [:]) {
+                    do {
+                        try pngData.write(to: tempURL)
+                        onPerformDrop?([tempURL])
+                        return true
+                    } catch {
+                        // fallback to other checks
+                    }
+                }
+            }
+        }
+        
+        // 3. Plain text / Strings
+        if let string = pasteboard.string(forType: .string) {
+            let tempURL = URL(fileURLWithPath: "/tmp/dropped_file.txt")
+            do {
+                try string.write(to: tempURL, atomically: true, encoding: .utf8)
+                onPerformDrop?([tempURL])
+                return true
+            } catch {
+                // fallback
+            }
+        }
+        
+        return false
     }
 }
 
@@ -80,8 +111,16 @@ class NotchDropZoneController: NSObject {
         dropZoneView.onDragEntered = onDragEntered
         dropZoneView.onDragExited = onDragExited
         dropZoneView.onPerformDrop = onPerformDrop
+        dropZoneView.registerForDraggedTypes([
+            .fileURL,
+            .URL,
+            .png,
+            .tiff,
+            .string
+        ])
         
         window.contentView = dropZoneView
         window.orderFrontRegardless()
     }
 }
+

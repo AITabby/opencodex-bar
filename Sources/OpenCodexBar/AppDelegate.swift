@@ -11,7 +11,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private var voiceManager: VoiceManager!
   private let replyFile = "/tmp/voice_reply.txt"
   private let logFile = "/tmp/ocb_debug.log"
-  private var sessionId: String?
+  var sessionId: String?
   private var lastQueryTime: Date?
   var hudWindowController: HUDWindowController?
   var notchDropZoneController: NotchDropZoneController?
@@ -54,27 +54,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  private func requestSystemPermissions() {
-    log("[Permissions] Requesting system permissions...")
-    // 1. Request Accessibility Permission (triggers system authorization prompt if not trusted)
-    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-    let axTrusted = AXIsProcessTrustedWithOptions(options)
-    log("[Permissions] Accessibility trusted status: \(axTrusted)")
-
-    // 2. Request Screen Recording Permission (triggers system authorization prompt if not authorized)
-    if #available(macOS 10.15, *) {
-      let screenRecordingTrusted = CGPreflightScreenCaptureAccess()
-      log("[Permissions] Screen Recording preflight status: \(screenRecordingTrusted)")
-      if !screenRecordingTrusted {
-        CGRequestScreenCaptureAccess()
-      }
-    }
-  }
-
   func applicationDidFinishLaunching(_ n: Notification) {
     AppDelegate.shared = self
     voiceManager = VoiceManager()
     hudWindowController = HUDWindowController()
+    WebSocketManager.shared.connect()
+    
+    // Do not restore the active session ID on startup. Start with a clean/new dialogue session.
+    self.sessionId = nil
+    log("[App] Started clean session for new dialogue.")
+    
+    // 设置 session 切换回调（启动时就生效）
+    WebSocketManager.shared.onActivateSession = { [weak self] sid in
+      self?.log("[VM] Activate session: \(sid)")
+      DispatchQueue.main.async {
+        self?.sessionId = sid
+        self?.hudWindowController?.updateState(state: "idle", amplitude: 0, text: "已切换到会话: \(sid.prefix(8))...")
+      }
+    }
     
     notchDropZoneController = NotchDropZoneController(
       onDragEntered: { [weak self] in
@@ -92,7 +89,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     try? "".write(toFile: logFile, atomically: true, encoding: .utf8)
     log("[App] Launch")
     
-    requestSystemPermissions()
     ensurePythonScripts()
     setupMainMenu()
     
@@ -100,9 +96,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       guard let self = self else { return }
       let apiClient = APIClient()
       self.statusBar = StatusBarController(apiClient: apiClient)
+      
+      // By default, do not start listening on launch. Wait for manual activation.
+      AppDelegate.shared?.log("[App] Ready. Waiting for activation.")
     }
     
-    try? registerHotkey()
+    do {
+      try registerHotkey()
+      log("[Hotkey] Registered global hotkey Option+Space successfully.")
+    } catch {
+      log("[Hotkey] Failed to register global hotkey Option+Space: \(error)")
+    }
   }
 
   func applicationWillTerminate(_ aNotification: Notification) {
@@ -156,6 +160,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     InstallEventHandler(
       GetApplicationEventTarget(),
       { _, _, _ in
+        AppDelegate.shared?.log("[Hotkey] Global hotkey pressed!")
         DispatchQueue.main.async { AppDelegate.shared?.toggleVoiceInput() }
         return noErr
       },
@@ -220,16 +225,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc func toggleVoiceInput() {
-    // Protect active query/operation phase from accidental false wake-word or hotkey interrupts
-    if currentAskProcess != nil {
-      log("[Toggle] Ignored hotkey because an active query or desktop operation is currently running")
+    // If there is an active query or audio playback, treat the hotkey as an interrupt (ESC / stop)
+    if currentAskProcess != nil || currentPlayProcess != nil || isPlayingQueue {
+      log("[Toggle] Interrupting active query/speech by user request")
+      cancelActiveVoiceOperations()
+      statusBar.setStatus(.idle)
+      hudWindowController?.hideHUD { [weak self] in
+        self?.resumeSystemMedia()
+      }
       return
     }
 
     cancelActiveVoiceOperations()
 
     if voiceManager.isListening {
-      voiceManager.stopListening()
+      voiceManager.cancelListening()
       statusBar.setStatus(.idle)
       hudWindowController?.hideHUD { [weak self] in
         self?.resumeSystemMedia()
@@ -342,28 +352,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       s.streamingQueue.async {
         guard s.currentQuerySequence == activeSeq else { return }
         
-        if !s.hasHitCodexResponsePrefix {
-          if let finalReply = s.extractFinalCodexResponse(reply) {
-            let cleaned = s.clean(finalReply)
-            if !cleaned.isEmpty {
-              s.log("[Stream TTS Fallback] No codex prefix in stream, but final reply is present. Speaking final reply.")
-              DispatchQueue.main.async {
-                guard s.currentQuerySequence == activeSeq else { return }
-                s.tts(cleaned)
-              }
-              return
-            }
-          }
-          
-          s.log("[Stream TTS Fallback] No codex prefix found in stream and no final reply. Speaking error fallback.")
-          DispatchQueue.main.async {
-            guard s.currentQuerySequence == activeSeq else { return }
-            s.tts("抱歉，我暂时未能生成回复，请查看屏幕或重试。")
-          }
-          return
-        }
-        
-        // Flush any remaining characters in streamCurrentSentence
+        // Always flush remaining sentence and set expected count
         let finalSentence = s.clean(s.streamCurrentSentence)
         if !finalSentence.isEmpty {
           let cleanedTail = s.cleanIntroductoryTail(finalSentence)
@@ -374,6 +363,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
           }
         }
         s.expectedSentenceCount = s.nextSentenceIndex
+        
+        // If no sentences were synthesized at all, try extractFinalCodexResponse
+        if s.nextSentenceIndex == 0 {
+          s.log("[TTS] No streaming sentences. Trying final reply extraction.")
+          if let finalReply = s.extractFinalCodexResponse(reply) {
+            let cleaned = s.clean(finalReply)
+            if !cleaned.isEmpty {
+              s.log("[TTS] Final reply available, speaking via tts().")
+              DispatchQueue.main.async {
+                guard s.currentQuerySequence == activeSeq else { return }
+                s.tts(cleaned)
+              }
+              return
+            }
+          }
+          s.log("[TTS] No speech content available.")
+          return
+        }
+        
         s.processPlayQueue()
       }
     }
@@ -487,7 +495,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         try task.run()
-        pty.master.write((prompt + "\n").data(using: .utf8)!)
+        let finalPrompt = prompt
+        log("[Prompt] Final prompt: \(finalPrompt.prefix(60))")
+        pty.master.write((finalPrompt + "\n").data(using: .utf8)!)
         pty.master.write(Data([4])) // Send Ctrl-D (EOF) to stdin
 
         sem.wait()
@@ -502,6 +512,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
           if self.sessionId != parsedSid {
             self.sessionId = parsedSid
             self.log("[SID] Updated to Session ID: \(parsedSid)")
+            WebSocketManager.shared.sendJson(["type": "active_session_changed", "session_id": parsedSid])
           }
         } else if errStr.lowercased().contains("session") && (errStr.lowercased().contains("not found") || errStr.lowercased().contains("invalid") || errStr.lowercased().contains("expired")) {
           self.sessionId = nil
@@ -712,7 +723,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private func synthesizeSentence(_ text: String, index: Int, querySeq: Int) {
     self.log("[Stream TTS] Synthesizing sentence \(index): '\(text)'")
     synthesizeFullReply(text) { [weak self] audioData in
-      guard let s = self, s.currentQuerySequence == querySeq else { return }
+      guard let s = self else { self?.log("[TTS] self is nil for sentence \(index)"); return }
+      guard s.currentQuerySequence == querySeq else {
+        s.log("[TTS] seq mismatch for sentence \(index): cur=\(s.currentQuerySequence) query=\(querySeq)")
+        return
+      }
+      s.log("[TTS] Got audio for sentence \(index) (\(audioData.count) bytes), queuing")
       s.queueAudio(audioData, text: text, index: index)
     }
   }
@@ -720,6 +736,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private func queueAudio(_ data: Data, text: String, index: Int) {
     streamingQueue.async { [weak self] in
       guard let self = self else { return }
+      self.log("[QAudio] index=\(index) data=\(data.count)b pending=\(self.pendingAudioMap.count) expected=\(self.expectedSentenceCount.map { String($0) } ?? "nil") playIdx=\(self.nextPlayIndex)")
       self.pendingAudioMap[index] = (data: data, text: text)
       self.processPlayQueue()
     }
@@ -727,10 +744,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
   private func processPlayQueue() {
     if isPlayingQueue {
+      log("[PlayQ] blocked: isPlayingQueue=true")
       return
     }
     
     if let expected = expectedSentenceCount, nextPlayIndex >= expected {
+      log("[PlayQ] done: nextPlayIndex=\(nextPlayIndex) >= expected=\(expected)")
       try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
@@ -741,6 +760,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     guard let nextItem = pendingAudioMap[nextPlayIndex] else {
+      log("[PlayQ] waiting: nextPlayIndex=\(nextPlayIndex) expected=\(expectedSentenceCount.map { String($0) } ?? "nil") pending_keys=\(pendingAudioMap.keys.sorted())")
       return
     }
     
@@ -768,6 +788,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let item = playQueue.removeFirst()
     let data = item.data
     let text = item.text
+    if data.isEmpty {
+      log("[PlayQ] Skipping empty audio item (TTS failed)")
+      streamingQueue.async { [weak self] in
+        self?.isPlayingQueue = false
+        self?.processPlayQueue()
+      }
+      return
+    }
     let isWav = data.count >= 4 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 // "RIFF"
     let ext = isWav ? "wav" : "mp3"
     let chunkFile = "/tmp/ocb_tts_chunk_\(playChunkIndex).\(ext)"
@@ -887,7 +915,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   private func tts(_ t: String) {
-    cancelActiveVoiceOperations()
+    if let existingPlay = currentPlayProcess {
+      if existingPlay.isRunning {
+        existingPlay.terminate()
+      }
+      currentPlayProcess = nil
+    }
+    speakingTimer?.invalidate()
+    speakingTimer = nil
+    
+    // Don't cancel voice operations (which would invalidate currentQuerySequence)
+    // — just stop any active afplay
     
     let cleaned = clean(t)
     var shortText = cleaned
@@ -915,7 +953,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   private func synthesizeFullReply(_ text: String, completion: @escaping (Data) -> Void) {
-    guard let jsonData = try? JSONSerialization.data(withJSONObject: ["text": text]) else { return }
+    guard let jsonData = try? JSONSerialization.data(withJSONObject: ["text": text]) else {
+      completion(Data())
+      return
+    }
     
     var request = URLRequest(url: URL(string: "http://localhost:8765/api/voice/tts")!)
     request.httpMethod = "POST"
@@ -925,10 +966,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       if let error = error {
         self?.log("[TTS Err] Synthesis failed: \(error.localizedDescription)")
+        completion(Data())
+        return
+      }
+      if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+        let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? "unknown"
+        self?.log("[TTS Err] HTTP \(http.statusCode): \(body.prefix(120))")
+        completion(Data())
         return
       }
       guard let data = data, !data.isEmpty else {
         self?.log("[TTS Err] Empty audio data returned")
+        completion(Data())
         return
       }
       completion(data)
@@ -1369,9 +1418,7 @@ if __name__ == "__main__":
     for pid in pids {
       if let path = getProcessPath(for: pid) {
         let lowerPath = path.lowercased()
-        let isMediaPlayer = lowerPath.contains("music.app") ||
-                            lowerPath.contains("spotify") ||
-                            lowerPath.contains("iina") ||
+        let isMediaPlayer = lowerPath.contains("iina") ||
                             lowerPath.contains("vlc") ||
                             lowerPath.contains("quicktime") ||
                             lowerPath.contains("neteasemusic") ||
@@ -1436,6 +1483,34 @@ if __name__ == "__main__":
       // Execute AppleScript to pause active browser video/audio elements (Safari, Chrome)
       let pauseScript = """
       set pausedApps to ""
+      
+      try
+          tell application "System Events" to set isMusicRunning to (exists process "Music")
+          if isMusicRunning then
+              set isPlaying to false
+              try
+                  set isPlaying to (run script "tell application \\"Music\\" to return (player state is playing)")
+              end try
+              if isPlaying then
+                  run script "tell application \\"Music\\" to pause"
+                  set pausedApps to pausedApps & "Music,"
+              end if
+          end if
+      end try
+      
+      try
+          tell application "System Events" to set isSpotifyRunning to (exists process "Spotify")
+          if isSpotifyRunning then
+              set isPlaying to false
+              try
+                  set isPlaying to (run script "tell application \\"Spotify\\" to return (player state is playing)")
+              end try
+              if isPlaying then
+                  run script "tell application \\"Spotify\\" to pause"
+                  set pausedApps to pausedApps & "Spotify,"
+              end if
+          end if
+      end try
       
       try
           tell application "System Events" to set isSafariRunning to (exists process "Safari")
@@ -1532,6 +1607,18 @@ if __name__ == "__main__":
       let resumeScript = """
       set pausedApps to "\(appsToResume)"
       
+      if pausedApps contains "Music" then
+          try
+              run script "tell application \\"Music\\" to play"
+          end try
+      end if
+      
+      if pausedApps contains "Spotify" then
+          try
+              run script "tell application \\"Spotify\\" to play"
+          end try
+      end if
+      
       try
           tell application "System Events" to set isSafariRunning to (exists process "Safari")
           if pausedApps contains "Safari" and isSafariRunning then
@@ -1592,16 +1679,19 @@ if __name__ == "__main__":
   }
 
   func handleDragEntered() {
+    log("[Notch] Drag entered")
     hudWindowController?.showHUD()
     hudWindowController?.updateState(state: "draghover", amplitude: 0.0, text: "")
   }
 
   func handleDragExited() {
+    log("[Notch] Drag exited")
     if voiceManager.isListening || currentAskProcess != nil || currentPlayProcess != nil { return }
     hudWindowController?.hideHUD()
   }
 
   func handlePerformDrop(_ urls: [URL]) {
+    log("[Notch] Perform drop with urls: \(urls)")
     guard let url = urls.first else { return }
     
     if let sound = NSSound(contentsOfFile: "/System/Library/Sounds/Tink.aiff", byReference: true) {

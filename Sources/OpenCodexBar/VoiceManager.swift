@@ -1,5 +1,4 @@
 import AVFoundation
-import Speech
 
 struct VoiceSettings: Decodable {
   var stt_engine: String?
@@ -8,13 +7,20 @@ struct VoiceSettings: Decodable {
   var stt_model: String?
   var tts_engine: String?
   var tts_api_key: String?
+  var tts_appid: String?
+  var tts_resource_id: String?
   var tts_base_url: String?
   var tts_model: String?
   var tts_voice: String?
   var vad_threshold: Float?
   var vad_duration: Double?
   var voice_llm_model: String?
-  
+  var enable_wake_word: Bool?
+  var hud_theme: String?
+  var active_session_id: String?
+  var voice_system_prompt: String?
+  var tts_resource: String?
+
   static func load() -> VoiceSettings {
     let home = NSHomeDirectory()
     let p = "\(home)/.opencodex/voice_settings.json"
@@ -26,258 +32,230 @@ struct VoiceSettings: Decodable {
   }
 }
 
-class VoiceManager: NSObject, AVAudioRecorderDelegate {
-  private var recorder: AVAudioRecorder?
+class VoiceManager: NSObject {
+  private let audioEngine = AVAudioEngine()
   private var completionHandler: ((String?) -> Void)?
-  private let fileURL = URL(fileURLWithPath: "/tmp/stt_input.m4a")
 
-  // Voice Activity Detection (VAD) properties
-  private var silenceTimer: Timer?
-  private var meteringTimer: Timer?
+  private var vadThreshold: Float = -35.0
+  private var vadDuration: Double = 2.0
   private var lowVolumeDuration: TimeInterval = 0.0
-  private var silenceThreshold: Float = -35.0 // Configured dynamically
-  private var requiredSilenceDuration: TimeInterval = 2.0 // Configured dynamically
   private var hasSpeechStarted = false
-  
-  var onNoSpeechTimeout: (() -> Void)?
+  private var isActive = false
+  private var isStopping = false
   private var noSpeechDuration: TimeInterval = 0.0
-  
+
+  var onNoSpeechTimeout: (() -> Void)?
+
+  private var vadTimer: Timer?
+  private var meteringTimer: Timer?
+
   var amplitudeUpdateHandler: ((Float) -> Void)?
 
   var isListening: Bool {
-    return recorder?.isRecording ?? false
-  }
-
-  override init() {
-    super.init()
-  }
-
-  private func getOpenApiKey() -> String {
-    let p = "/Users/aitabby/.opencodex/providers.json"
-    guard let data = try? Data(contentsOf: URL(fileURLWithPath: p)),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-      return "sk-LyjwiyqgDyyhQ5xhy8a9bALhtI7irtDHusLvy6o58qRFCdDQCajHNxIs4tmYK6ug"
-    }
-    for item in json {
-      if let name = item["name"] as? String, name == "opencode", let key = item["api_key"] as? String {
-        return key
-      }
-    }
-    return "sk-LyjwiyqgDyyhQ5xhy8a9bALhtI7irtDHusLvy6o58qRFCdDQCajHNxIs4tmYK6ug"
+    return isActive
   }
 
   func startListening(completion: @escaping (String?) -> Void) {
-    AppDelegate.shared?.log("[VM] startListening called")
-    completionHandler = completion
+    AppDelegate.shared?.log("[VM] startListening (local VAD + WS)")
+    WebSocketManager.shared.connect()
     
-    // Load dynamic voice settings
-    let voiceSettings = VoiceSettings.load()
-    self.silenceThreshold = voiceSettings.vad_threshold ?? -35.0
-    self.requiredSilenceDuration = voiceSettings.vad_duration ?? 2.0
-    AppDelegate.shared?.log("[VM] Loaded settings: STT = \(voiceSettings.stt_engine ?? "local-whisper"), TTS = \(voiceSettings.tts_engine ?? "edge-tts")")
-    
-    // Configure audio recording settings (AAC compressed M4A)
-    let settings: [String: Any] = [
-      AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-      AVSampleRateKey: 16000.0,
-      AVNumberOfChannelsKey: 1,
-      AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
-    ]
-
-    do {
-      try? FileManager.default.removeItem(at: fileURL)
-      
-      recorder = try AVAudioRecorder(url: fileURL, settings: settings)
-      recorder?.delegate = self
-      recorder?.isMeteringEnabled = true // Enable decibel metering for VAD
-      
-      let prepared = recorder?.prepareToRecord() ?? false
-      let started = recorder?.record() ?? false
-      AppDelegate.shared?.log("[VM] Recorder prep: \(prepared), record start: \(started)")
-      
-      if !started {
-        AppDelegate.shared?.log("[VM Err] Recorder failed to start recording!")
-        completion(nil)
-        return
-      }
-      
-      // Start real-time Voice Activity Detection (VAD) silence monitoring
-      lowVolumeDuration = 0.0
-      noSpeechDuration = 0.0
-      hasSpeechStarted = false
-      silenceTimer?.invalidate()
-      
-      var ticksCount = 0
-      var logCounter = 0
-      silenceTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-        guard let self = self, let rec = self.recorder, rec.isRecording else { return }
-        ticksCount += 1
-        
-        rec.updateMeters()
-        var power = rec.averagePower(forChannel: 0)
-        
-        // Anti-Acoustic Feedback Loop: If the AI is currently playing TTS speech, treat it as silence
-        if let appDelegate = AppDelegate.shared, appDelegate.currentPlayProcess != nil {
-          power = -100.0
-        }
-        
-        logCounter += 1
-        if logCounter % 10 == 0 {
-          AppDelegate.shared?.log("[VM Timer] Tick: power = \(power) dB, hasSpeechStarted = \(self.hasSpeechStarted), lowVolumeDuration = \(self.lowVolumeDuration)")
-        }
-        
-        // Ignore decibel checks during the first 0.4 seconds (warmup blanking window to avoid hardware clicks/pops)
-        if ticksCount < 4 {
-          self.hasSpeechStarted = false
-          self.lowVolumeDuration = 0.0
-          return
-        }
-        
-        if !self.hasSpeechStarted {
-          self.noSpeechDuration += 0.1
-          if self.onNoSpeechTimeout != nil && self.noSpeechDuration >= 4.0 {
-            AppDelegate.shared?.log("[VAD] User didn't speak for 4 seconds since start, triggering timeout...")
-            let handler = self.onNoSpeechTimeout
-            self.stopListening()
-            handler?()
+    // 显式请求麦克风权限
+    if #available(macOS 14.0, *) {
+      AVAudioApplication.requestRecordPermission { granted in
+        DispatchQueue.main.async {
+          if !granted {
+            AppDelegate.shared?.log("[VM] Microphone permission denied!")
+            completion(nil)
             return
           }
-        }
-        
-        if power >= self.silenceThreshold {
-          if !self.hasSpeechStarted {
-            AppDelegate.shared?.log("[VAD] Speech started! Power: \(power) dB (Threshold: \(self.silenceThreshold) dB)")
-          }
-          self.hasSpeechStarted = true
-          self.lowVolumeDuration = 0.0 // Reset duration since speech is active
-        } else {
-          if self.hasSpeechStarted {
-            self.lowVolumeDuration += 0.1
-          }
-        }
-        
-        // Auto-stop recording if user stops speaking for silence duration
-        if self.lowVolumeDuration >= self.requiredSilenceDuration {
-          AppDelegate.shared?.log("[VAD] Silence detected for \(self.requiredSilenceDuration)s, auto-stopping...")
-          self.stopListening()
+          self.continueListening(completion: completion)
         }
       }
-      
-      // Start high-frequency (33ms) visualizer metering timer
-      self.meteringTimer?.invalidate()
-      self.meteringTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
-        guard let self = self, let rec = self.recorder, rec.isRecording else { return }
-        rec.updateMeters()
-        var power = rec.averagePower(forChannel: 0)
-        
-        // Anti-Acoustic Feedback Loop: If the AI is currently playing TTS speech, treat it as silence
-        if let appDelegate = AppDelegate.shared, appDelegate.currentPlayProcess != nil {
+    } else {
+      self.continueListening(completion: completion)
+    }
+  }
+  
+  private func continueListening(completion: @escaping (String?) -> Void) {
+    completionHandler = completion
+
+    let settings = VoiceSettings.load()
+    vadThreshold = settings.vad_threshold ?? -35.0
+    vadDuration = settings.vad_duration ?? 2.0
+    AppDelegate.shared?.log("[VM] VAD threshold=\(vadThreshold)dB duration=\(vadDuration)s")
+
+    let inputNode = audioEngine.inputNode
+    let hwFormat = inputNode.outputFormat(forBus: 0)
+    AppDelegate.shared?.log("[VM] HW format: \(hwFormat.sampleRate)Hz \(hwFormat.channelCount)ch")
+
+    let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)!
+    guard let converter = AVAudioConverter(from: hwFormat, to: targetFormat) else {
+      AppDelegate.shared?.log("[VM Err] Cannot create converter")
+      completion(nil)
+      return
+    }
+
+    lowVolumeDuration = 0.0
+    hasSpeechStarted = false
+    isActive = true
+
+    inputNode.installTap(onBus: 0, bufferSize: 3200, format: hwFormat) { [weak self] buffer, _ in
+      guard let self = self, self.isActive else { return }
+      let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+        outStatus.pointee = .haveData
+        return buffer
+      }
+      let fc = AVAudioFrameCount(Double(buffer.frameLength) * 16000.0 / hwFormat.sampleRate)
+      guard let outBuf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: fc) else { return }
+      var err: NSError?
+      let status = converter.convert(to: outBuf, error: &err, withInputFrom: inputBlock)
+      guard status == .haveData, let ch = outBuf.int16ChannelData else { return }
+
+      let count = Int(outBuf.frameLength)
+      if count > 0 {
+        let data = Data(bytes: ch[0], count: count * 2)
+        WebSocketManager.shared.sendAudioChunk(data)
+
+        var sumSq: Double = 0
+        for i in 0..<count {
+          let s = Double(ch[0][i]) / Double(Int16.max)
+          sumSq += s * s
+        }
+        let rms = sqrt(sumSq / Double(count))
+        var power: Float = 20.0 * log10(Float(max(rms, 0.0001)))
+        if let ad = AppDelegate.shared, ad.currentPlayProcess != nil {
           power = -100.0
         }
-        let minDb: Float = -60.0
-        let maxDb: Float = -10.0
-        let clamped = max(minDb, min(maxDb, power))
-        let amplitude = (clamped - minDb) / (maxDb - minDb)
-        self.amplitudeUpdateHandler?(amplitude)
+        currentPower = power
       }
-      
-      // Safety net: Auto-stop after 25 seconds of continuous recording to protect resources
-      DispatchQueue.global().asyncAfter(deadline: .now() + 25) { [weak self] in
-        guard let self = self, self.isListening else { return }
-        AppDelegate.shared?.log("[VAD] Max recording limit (25s) reached, auto-stopping...")
+    }
+
+    WebSocketManager.shared.onTranscriptionFinal = { [weak self] text in
+      AppDelegate.shared?.log("[VM STT] Final: '\(text.prefix(50))'")
+      DispatchQueue.main.async {
+        guard let self = self else { return }
+        self.stopEngine()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.completionHandler?(trimmed.isEmpty ? nil : trimmed)
+        self.completionHandler = nil
+      }
+    }
+
+    WebSocketManager.shared.onActivateSession = { sid in
+      AppDelegate.shared?.log("[VM] Activate session: \(sid)")
+      DispatchQueue.main.async {
+        AppDelegate.shared?.sessionId = sid
+        AppDelegate.shared?.hudWindowController?.updateState(state: "idle", amplitude: 0, text: "已切换到会话: \(sid.prefix(8))...")
+      }
+    }
+
+    var tickCount = 0
+    vadTimer?.invalidate()
+    vadTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+      guard let self = self, self.isActive, !self.isStopping else { return }
+      tickCount += 1
+      let power = self.currentPower
+
+      if tickCount < 4 {
+        self.hasSpeechStarted = false
+        self.lowVolumeDuration = 0.0
+        return
+      }
+
+      if !self.hasSpeechStarted {
+        self.noSpeechDuration += 0.1
+        if self.noSpeechDuration >= 4.0 && self.onNoSpeechTimeout != nil {
+          AppDelegate.shared?.log("[VAD] No speech for 4s → timeout")
+          let handler = self.onNoSpeechTimeout
+          self.stopEngine()
+          handler?()
+          return
+        }
+      }
+
+      if power >= self.vadThreshold {
+        if !self.hasSpeechStarted {
+          AppDelegate.shared?.log("[VAD] Speech started")
+        }
+        self.hasSpeechStarted = true
+        self.lowVolumeDuration = 0.0
+        self.noSpeechDuration = 0.0
+      } else {
+        if self.hasSpeechStarted {
+          self.lowVolumeDuration += 0.1
+        }
+      }
+
+      if self.lowVolumeDuration >= self.vadDuration {
+        AppDelegate.shared?.log("[VAD] Silence \(self.vadDuration)s → stopping")
         self.stopListening()
       }
-      
+    }
+
+    meteringTimer?.invalidate()
+    meteringTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
+      guard let self = self, self.isActive else { return }
+      let p = self.currentPower
+      let clamped = max(-60.0, min(-10.0, p))
+      let amp = (clamped + 60.0) / 50.0
+      self.amplitudeUpdateHandler?(amp)
+    }
+
+    do {
+      try audioEngine.start()
+      WebSocketManager.shared.sendStartSTT()
+      AppDelegate.shared?.log("[VM] Engine started, STT streaming")
     } catch {
-      AppDelegate.shared?.log("[VM Err] Failed to initialize recorder: \(error.localizedDescription)")
+      AppDelegate.shared?.log("[VM Err] Engine start: \(error.localizedDescription)")
       completion(nil)
     }
+
+    DispatchQueue.global().asyncAfter(deadline: .now() + 25) { [weak self] in
+      guard let self = self, self.isActive else { return }
+      AppDelegate.shared?.log("[VM] 25s timeout → stop")
+      self.stopListening()
+    }
+  }
+
+  private var currentPower: Float = -100.0
+
+  func cancelListening() {
+    AppDelegate.shared?.log("[VM] cancelListening")
+    guard isActive else { return }
+    if let h = completionHandler {
+      completionHandler = nil
+      DispatchQueue.main.async { h(nil) }
+    }
+    stopEngine()
   }
 
   func stopListening() {
-    AppDelegate.shared?.log("[VM] stopListening called, isListening = \(isListening)")
-    guard isListening else { return }
-    silenceTimer?.invalidate()
-    silenceTimer = nil
-    meteringTimer?.invalidate()
-    meteringTimer = nil
-    recorder?.stop()
+    AppDelegate.shared?.log("[VM] stopListening")
+    guard isActive, !isStopping else { return }
+    isStopping = true
+    WebSocketManager.shared.sendStopSTT()
+    AppDelegate.shared?.log("[VM] Sent stop_stt, awaiting transcription_final")
+
+    DispatchQueue.global().asyncAfter(deadline: .now() + 10) { [weak self] in
+      guard let self = self, self.isActive else { return }
+      AppDelegate.shared?.log("[VM] STT timeout 10s → giving up")
+      self.stopEngine()
+      DispatchQueue.main.async {
+        self.completionHandler?(nil)
+        self.completionHandler = nil
+      }
+    }
   }
 
-  // MARK: - AVAudioRecorderDelegate
-  func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
-    AppDelegate.shared?.log("[VM] audioRecorderDidFinishRecording success = \(flag)")
-    silenceTimer?.invalidate()
-    silenceTimer = nil
+  private func stopEngine() {
+    isActive = false
+    isStopping = false
+    vadTimer?.invalidate()
+    vadTimer = nil
     meteringTimer?.invalidate()
     meteringTimer = nil
-    
-    // Immediately show "Thinking..." status on the HUD as soon as recording finishes/transcription begins
-    DispatchQueue.main.async {
-      AppDelegate.shared?.hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "Thinking...")
-      AppDelegate.shared?.statusBar.setStatus(.sending)
-    }
-    
-    guard flag else {
-      DispatchQueue.main.async { [weak self] in
-        self?.completionHandler?(nil)
-        self?.completionHandler = nil
-      }
-      return
-    }
-
-    // Delegate transcription completely to Node.js server voice API
-    AppDelegate.shared?.log("[VM] Delegating speech file to local server STT endpoint...")
-    guard let fileData = try? Data(contentsOf: fileURL) else {
-      AppDelegate.shared?.log("[VM Err] Failed to read audio file at \(fileURL.path)")
-      DispatchQueue.main.async { [weak self] in
-        self?.completionHandler?(nil)
-        self?.completionHandler = nil
-      }
-      return
-    }
-
-    var request = URLRequest(url: URL(string: "http://localhost:8765/api/voice/stt")!)
-    request.httpMethod = "POST"
-    request.httpBody = fileData
-    request.setValue("audio/m4a", forHTTPHeaderField: "Content-Type")
-
-    let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-      if let error = error {
-        AppDelegate.shared?.log("[VM Server STT Err] Network error: \(error.localizedDescription)")
-        DispatchQueue.main.async {
-          self?.completionHandler?(nil)
-          self?.completionHandler = nil
-        }
-        return
-      }
-
-      guard let data = data else {
-        AppDelegate.shared?.log("[VM Server STT Err] Empty server response")
-        DispatchQueue.main.async {
-          self?.completionHandler?(nil)
-          self?.completionHandler = nil
-        }
-        return
-      }
-
-      if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-         let text = json["text"] as? String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        AppDelegate.shared?.log("[VM Server STT Result] Transcribed: '\(trimmed)'")
-        DispatchQueue.main.async {
-          self?.completionHandler?(trimmed.isEmpty ? nil : trimmed)
-          self?.completionHandler = nil
-        }
-      } else {
-        let rawStr = String(data: data, encoding: .utf8) ?? ""
-        AppDelegate.shared?.log("[VM Server STT Err] Bad JSON response: \(rawStr)")
-        DispatchQueue.main.async {
-          self?.completionHandler?(nil)
-          self?.completionHandler = nil
-        }
-      }
-    }
-    task.resume()
+    audioEngine.inputNode.removeTap(onBus: 0)
+    audioEngine.stop()
+    WebSocketManager.shared.onTranscriptionFinal = nil
   }
 }

@@ -13,7 +13,7 @@ class StatusBarController {
   private let statusItem: NSStatusItem
   private let popover: NSPopover
   private let apiClient: APIClient
-  private var currentStatus: AppStatus = .offline
+  private var currentStatus: AppStatus = .idle
   private var animationTimer: Timer?
   private var frameIndex = 0
 
@@ -128,8 +128,9 @@ class StatusBarController {
     newChatItem.target = self
     menu.addItem(newChatItem)
 
-    let voiceItem = NSMenuItem(title: "Toggle Voice (⌥Space)", action: nil, keyEquivalent: "")
-    voiceItem.isEnabled = false
+    let voiceItem = NSMenuItem(title: "Toggle Voice (⌥Space)", action: #selector(toggleVoice), keyEquivalent: " ")
+    voiceItem.keyEquivalentModifierMask = [.option]
+    voiceItem.target = self
     menu.addItem(voiceItem)
 
     menu.addItem(NSMenuItem.separator())
@@ -147,6 +148,10 @@ class StatusBarController {
 
   @objc private func openDashboard() {
     NSWorkspace.shared.open(URL(string: "http://localhost:8765/dashboard")!)
+  }
+
+  @objc private func toggleVoice() {
+    AppDelegate.shared?.toggleVoiceInput()
   }
 
   @objc private func startNewConversation() {
