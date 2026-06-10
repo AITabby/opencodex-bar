@@ -5,7 +5,7 @@
 ---
 
 <p align="center">
-  <img src="preview.png" alt="OpenCodexBar Widescreen Visualizer" width="800">
+  <img src="preview_voice.png" alt="OpenCodexBar Widescreen Visualizer" width="800">
 </p>
 
 # English
