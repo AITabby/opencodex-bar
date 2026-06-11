@@ -465,15 +465,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cb("[错误]")
         return
       }
+      let ptyErrPipe = Pipe()
       task.standardInput = pty.slave
       task.standardOutput = pty.slave
-      task.standardError = pty.slave
+      task.standardError = ptyErrPipe
 
       let sem = DispatchSemaphore(value: 0)
       var errData = Data()
       let errQueue = DispatchQueue(label: "com.opencodex.err")
       
+      ptyErrPipe.fileHandleForReading.readabilityHandler = { [weak self] fileHandle in
+        let data = fileHandle.availableData
+        if data.isEmpty { return }
+        if let errString = String(data: data, encoding: .utf8) {
+          self?.log("[Codex CLI Err] \(errString.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+      }
+
       task.terminationHandler = { _ in
+        ptyErrPipe.fileHandleForReading.readabilityHandler = nil
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
           pty.master.readabilityHandler = nil
           sem.signal()
