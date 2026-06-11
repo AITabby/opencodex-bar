@@ -21,7 +21,7 @@ class WebSocketManager: NSObject {
       self.isConnected = false
       self.task?.cancel(with: .goingAway, reason: nil)
       
-      let url = URL(string: "ws://localhost:8765")!
+      let url = URL(string: "ws://127.0.0.1:8765")!
       let session = URLSession(configuration: .default)
       let t = session.webSocketTask(with: url)
       self.task = t

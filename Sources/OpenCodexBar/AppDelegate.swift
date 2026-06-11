@@ -465,30 +465,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cb("[错误]")
         return
       }
-      let ptyErrPipe = Pipe()
-      task.standardInput = pty.slave
-      task.standardOutput = pty.slave
-      task.standardError = ptyErrPipe
-
-      let sem = DispatchSemaphore(value: 0)
-      var errData = Data()
-      let errQueue = DispatchQueue(label: "com.opencodex.err")
-      
-      ptyErrPipe.fileHandleForReading.readabilityHandler = { [weak self] fileHandle in
-        let data = fileHandle.availableData
-        if data.isEmpty { return }
-        if let errString = String(data: data, encoding: .utf8) {
-          self?.log("[Codex CLI Err] \(errString.trimmingCharacters(in: .whitespacesAndNewlines))")
-        }
-      }
-
-      task.terminationHandler = { _ in
-        ptyErrPipe.fileHandleForReading.readabilityHandler = nil
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
-          pty.master.readabilityHandler = nil
-          sem.signal()
-        }
-      }
+       task.standardInput = pty.slave
+       task.standardOutput = pty.slave
+       task.standardError = pty.slave
+ 
+       let sem = DispatchSemaphore(value: 0)
+       var errData = Data()
+       let errQueue = DispatchQueue(label: "com.opencodex.err")
+ 
+       task.terminationHandler = { _ in
+         DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+           pty.master.readabilityHandler = nil
+           sem.signal()
+         }
+       }
 
       do {
         pty.master.readabilityHandler = { [weak self] fileHandle in
@@ -968,7 +958,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       return
     }
     
-    var request = URLRequest(url: URL(string: "http://localhost:8765/api/voice/tts")!)
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:8765/api/voice/tts")!)
     request.httpMethod = "POST"
     request.httpBody = jsonData
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")

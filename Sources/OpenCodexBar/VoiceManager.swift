@@ -94,6 +94,7 @@ class VoiceManager: NSObject {
       completion(nil)
       return
     }
+    converter.channelMap = [0]
 
     lowVolumeDuration = 0.0
     hasSpeechStarted = false

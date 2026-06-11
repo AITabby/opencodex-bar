@@ -73,7 +73,7 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
 
   func loadVisualizer() {
     let t = Int(Date().timeIntervalSince1970)
-    guard let url = URL(string: "http://localhost:8765/visualizer?mode=hud&t=\(t)") else { return }
+    guard let url = URL(string: "http://127.0.0.1:8765/visualizer?mode=hud&t=\(t)") else { return }
     
     let dataStore = WKWebsiteDataStore.default()
     dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: Date(timeIntervalSince1970: 0)) { [weak self] in
@@ -83,6 +83,7 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
   }
 
   func showHUD() {
+    loadVisualizer()
     guard let window = self.window else { return }
     hudSessionId += 1
 

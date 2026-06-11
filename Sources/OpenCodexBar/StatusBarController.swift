@@ -147,7 +147,7 @@ class StatusBarController {
   }
 
   @objc private func openDashboard() {
-    NSWorkspace.shared.open(URL(string: "http://localhost:8765/dashboard")!)
+    NSWorkspace.shared.open(URL(string: "http://127.0.0.1:8765/dashboard")!)
   }
 
   @objc private func toggleVoice() {
