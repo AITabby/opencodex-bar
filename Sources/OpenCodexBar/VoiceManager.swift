@@ -81,8 +81,8 @@ class VoiceManager: NSObject {
 
     let settings = VoiceSettings.load()
     vadThreshold = settings.vad_threshold ?? -35.0
-    vadDuration = settings.vad_duration ?? 2.0
-    AppDelegate.shared?.log("[VM] VAD threshold=\(vadThreshold)dB duration=\(vadDuration)s")
+    vadDuration = 3.5 // Fallback safety timer, let proxy Semantic VAD do the quick cutoff
+    AppDelegate.shared?.log("[VM] VAD threshold=\(vadThreshold)dB fallback duration=\(vadDuration)s")
 
     let inputNode = audioEngine.inputNode
     let hwFormat = inputNode.outputFormat(forBus: 0)
@@ -139,6 +139,17 @@ class VoiceManager: NSObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         self.completionHandler?(trimmed.isEmpty ? nil : trimmed)
         self.completionHandler = nil
+      }
+    }
+
+    WebSocketManager.shared.onStopRecording = { [weak self] text in
+      AppDelegate.shared?.log("[VM] Server requested stop recording early for text: '\(text.prefix(50))'")
+      DispatchQueue.main.async {
+        guard let self = self, self.isActive else { return }
+        // Update HUD to show thinking/loading state instantly
+        AppDelegate.shared?.hudWindowController?.updateState(state: "thinking", amplitude: 0, text: text)
+        // Locally stop engine without triggering duplicate stop_stt
+        self.stopEngine()
       }
     }
 
@@ -258,5 +269,6 @@ class VoiceManager: NSObject {
     audioEngine.inputNode.removeTap(onBus: 0)
     audioEngine.stop()
     WebSocketManager.shared.onTranscriptionFinal = nil
+    WebSocketManager.shared.onStopRecording = nil
   }
 }

@@ -45,6 +45,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private var expectedSentenceCount: Int? = nil
   private var streamProcessedCharCount = 0
   private var streamInCodeBlock = false
+  private var proxyProcess: Process?
 
   func log(_ m: String) {
     if let h = FileHandle(forWritingAtPath: logFile) {
@@ -56,6 +57,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationDidFinishLaunching(_ n: Notification) {
     AppDelegate.shared = self
+    
+    // Auto launch opencodex proxy in background
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    p.arguments = ["npm", "run", "dev"]
+    p.currentDirectoryURL = URL(fileURLWithPath: "/Users/aitabby/projects/opencodex")
+    
+    // Inject node path environment variables if needed
+    var env = ProcessInfo.processInfo.environment
+    let customPath = "/opt/homebrew/bin:/usr/local/bin"
+    if let currentPath = env["PATH"] {
+      env["PATH"] = "\(customPath):\(currentPath)"
+    } else {
+      env["PATH"] = customPath
+    }
+    p.environment = env
+    
+    do {
+      try p.run()
+      proxyProcess = p
+      log("[App] Spawned Node.js OpenCodex Proxy Server process in background.")
+    } catch {
+      log("[App Err] Failed to spawn Node.js Proxy Server: \(error.localizedDescription)")
+    }
+    
     voiceManager = VoiceManager()
     hudWindowController = HUDWindowController()
     WebSocketManager.shared.connect()
@@ -133,6 +159,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         contTask.executableURL = URL(fileURLWithPath: "/bin/kill")
         contTask.arguments = ["-CONT", "\(pid)"]
         try? contTask.run()
+    }
+
+    if let p = proxyProcess, p.isRunning {
+      p.terminate()
+      log("[App] Terminated local OpenCodex proxy server.")
     }
   }
 
@@ -1228,14 +1259,15 @@ def main():
     url = f"{api_host}/v1/t2a_v2"
     
     payload = {
-        "model": "speech-01-turbo",
+        "model": "speech-2.8-turbo",
         "text": text,
         "stream": False,
         "voice_setting": {
             "voice_id": voice_id,
             "speed": 1.0,
             "vol": 1.0,
-            "pitch": 0
+            "pitch": 0,
+            "emotion": "happy"
         },
         "audio_setting": {
             "sample_rate": 32000,
@@ -1266,9 +1298,13 @@ def main():
                 print(f"ERROR: MiniMax API Error: {msg}")
                 sys.exit(1)
                 
-            audio_hex = res_json.get("data")
-            if not audio_hex:
+            audio_data = res_json.get("data")
+            if not audio_data:
                 print("ERROR: No audio data returned from MiniMax")
+                sys.exit(1)
+            audio_hex = audio_data.get("audio") if isinstance(audio_data, dict) else audio_data
+            if not audio_hex:
+                print("ERROR: No audio hex string found")
                 sys.exit(1)
                 
             audio_bytes = binascii.unhexlify(audio_hex)

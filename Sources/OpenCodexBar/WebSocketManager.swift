@@ -9,6 +9,7 @@ class WebSocketManager: NSObject {
   var onTranscriptionPartial: ((String) -> Void)?
   var onTranscriptionFinal: ((String) -> Void)?
   var onActivateSession: ((String) -> Void)?
+  var onStopRecording: ((String) -> Void)?
 
   private let queue = DispatchQueue(label: "com.opencodex.ws")
 
@@ -64,6 +65,10 @@ class WebSocketManager: NSObject {
     case "transcription_final":
       if let t = json["text"] as? String {
         onTranscriptionFinal?(t)
+      }
+    case "stop_recording":
+      if let t = json["text"] as? String {
+        onStopRecording?(t)
       }
     case "activate_session":
       if let sid = json["session_id"] as? String {
