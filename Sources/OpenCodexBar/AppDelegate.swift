@@ -58,6 +58,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ n: Notification) {
     AppDelegate.shared = self
     
+    // Request accessibility permission on startup
+    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+    _ = AXIsProcessTrustedWithOptions(options)
+    
     // Auto launch opencodex proxy in background
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -418,7 +422,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  private func openPty() -> (master: FileHandle, slave: FileHandle)? {
+    private var prewarmedAskProcess: Process?
+  private var prewarmedPty: (master: FileHandle, slave: FileHandle)?
+
+  @objc func prewarmCodexProcess() {
+    DispatchQueue.global().async { [weak self] in
+      guard let self = self else { return }
+      if self.prewarmedAskProcess != nil { return }
+      self.log("[Ask] Prewarming Codex process...")
+      let task = Process()
+      task.executableURL = URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex")
+      var env = ProcessInfo.processInfo.environment
+      let localBin = "\(NSHomeDirectory())/.gemini/antigravity/bin"
+      let customPath = "\(localBin):/opt/homebrew/bin:/usr/local/bin"
+      if let currentPath = env["PATH"] { env["PATH"] = "\(customPath):\(currentPath)" } else { env["PATH"] = customPath }
+      task.environment = env
+      task.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
+      let settings = VoiceSettings.load()
+      var args = ["--dangerously-bypass-approvals-and-sandbox", "exec"]
+      if let model = settings.voice_llm_model, !model.isEmpty { args.append(contentsOf: ["--model", model]) }
+      if let sid = self.sessionId { args.append(contentsOf: ["resume", sid]) }
+      args.append(contentsOf: ["--skip-git-repo-check", "-"])
+      task.arguments = args
+      guard let pty = self.openPty() else { return }
+      task.standardInput = pty.slave
+      task.standardOutput = pty.slave
+      task.standardError = pty.slave
+      do {
+        try task.run()
+        self.prewarmedAskProcess = task
+        self.prewarmedPty = pty
+        self.log("[Ask] Prewarm successful.")
+      } catch {
+        self.log("[Ask Err] Prewarm failed.")
+      }
+    }
+  }
+private func openPty() -> (master: FileHandle, slave: FileHandle)? {
     var masterFd: Int32 = 0
     masterFd = posix_openpt(O_RDWR | O_NOCTTY)
     guard masterFd >= 0 else { return nil }
@@ -453,116 +493,81 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     log("[Ask] \(prompt.prefix(60))")
     DispatchQueue.global().async { [weak self] in
       guard let self = self else { return }
-      if let existing = self.currentAskProcess, existing.isRunning {
-        existing.terminate()
-        self.log("[Ask] Cancelled active query")
-      }
       
-      let task = Process()
-      self.currentAskProcess = task
-      DispatchQueue.main.async {
-        NSApplication.shared.activate(ignoringOtherApps: true)
-      }
-      task.executableURL = URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex")
-
-      var env = ProcessInfo.processInfo.environment
-      let localBin = "\(NSHomeDirectory())/.gemini/antigravity/bin"
-      let customPath = "\(localBin):/opt/homebrew/bin:/usr/local/bin"
-      if let currentPath = env["PATH"] {
-        env["PATH"] = "\(customPath):\(currentPath)"
-      } else {
-        env["PATH"] = customPath
-      }
-      task.environment = env
-
-      task.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
-
-      let settings = VoiceSettings.load()
-      var args = [
-        "--dangerously-bypass-approvals-and-sandbox",
-        "exec"
-      ]
-      if let model = settings.voice_llm_model, !model.isEmpty {
-        args.append(contentsOf: ["--model", model])
-      }
-      if let sid = self.sessionId {
-        args.append(contentsOf: ["resume", sid])
-      }
-      args.append(contentsOf: ["--skip-git-repo-check", "-"])
-      task.arguments = args
-
-      guard let pty = self.openPty() else {
-        self.log("[PTY Err] Failed to create PTY")
-        cb("[错误]")
-        return
-      }
-       task.standardInput = pty.slave
-       task.standardOutput = pty.slave
-       task.standardError = pty.slave
- 
-       let sem = DispatchSemaphore(value: 0)
-       var errData = Data()
-       let errQueue = DispatchQueue(label: "com.opencodex.err")
- 
-       task.terminationHandler = { _ in
-         DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
-           pty.master.readabilityHandler = nil
-           sem.signal()
-         }
-       }
-
-      do {
-        pty.master.readabilityHandler = { [weak self] fileHandle in
-          guard let self = self else { return }
-          let data = fileHandle.availableData
-          if data.isEmpty { return }
-          if let chunk = String(data: data, encoding: .utf8) {
-            let activeSeq = self.currentQuerySequence
-            self.processStreamingChunk(chunk, querySeq: activeSeq)
-            errQueue.async {
-              errData.append(data)
+      let activeSeq = self.currentQuerySequence
+      
+      // If we don't have a running interactive process, start one!
+      if self.currentAskProcess == nil || !self.currentAskProcess!.isRunning {
+        self.log("[Ask] Booting persistent interactive Codex process...")
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex")
+        var env = ProcessInfo.processInfo.environment
+        let localBin = "\(NSHomeDirectory())/.gemini/antigravity/bin"
+        let customPath = "\(localBin):/opt/homebrew/bin:/usr/local/bin"
+        if let currentPath = env["PATH"] { env["PATH"] = "\(customPath):\(currentPath)" } else { env["PATH"] = customPath }
+        task.environment = env
+        task.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
+        let settings = VoiceSettings.load()
+        var args = ["--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"]
+        if let model = settings.voice_llm_model, !model.isEmpty { args.append(contentsOf: ["--model", model]) }
+        // We do NOT append "exec" or "resume <sid>" because interactive mode handles history internally!
+        task.arguments = args
+        
+        guard let newPty = self.openPty() else { cb("[错误]"); return }
+        task.standardInput = newPty.slave
+        task.standardOutput = newPty.slave
+        task.standardError = newPty.slave
+        
+        do {
+          try task.run()
+          self.currentAskProcess = task
+          self.prewarmedPty = newPty
+          self.log("[Ask] Persistent process started.")
+          
+          // Set up the persistent readability handler
+          newPty.master.readabilityHandler = { [weak self] fileHandle in
+            guard let self = self else { return }
+            let data = fileHandle.availableData
+            if data.isEmpty { return }
+            if let chunk = String(data: data, encoding: .utf8) {
+              let cleanChunk = chunk.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
+              
+              // Only process streaming if it's not the prompt itself
+              if !cleanChunk.trimmingCharacters(in: .whitespaces).isEmpty && cleanChunk != "❯" {
+                 self.processStreamingChunk(cleanChunk, querySeq: self.currentQuerySequence)
+              }
+              
+              // If we see the interactive prompt, the response is finished!
+              if cleanChunk.contains("❯") {
+                self.streamingQueue.async {
+                  var output = self.streamResponseText
+                  output = output.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
+                  output = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                  self.log("[Resp FINISHED] \(output.prefix(80))")
+                  
+                  // Clear stream text for the next turn
+                  self.streamResponseText = ""
+                  
+                  DispatchQueue.main.async { cb(output) }
+                }
+              }
             }
           }
+        } catch {
+          self.log("[Ask Err] Failed to start persistent process.")
+          DispatchQueue.main.async { cb("[错误]") }
+          return
         }
-
-        try task.run()
-        let finalPrompt = prompt
-        log("[Prompt] Final prompt: \(finalPrompt.prefix(60))")
-        pty.master.write((finalPrompt + "\n").data(using: .utf8)!)
-        pty.master.write(Data([4])) // Send Ctrl-D (EOF) to stdin
-
-        sem.wait()
-        self.currentAskProcess = nil
-
-        var errStr = String(data: errData, encoding: .utf8) ?? ""
-        errStr = errStr.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
-        if let r = errStr.range(of: "session id: ([\\w-]+)", options: .regularExpression) {
-          let parsedSid = String(errStr[r])
-            .replacingOccurrences(of: "session id: ", with: "")
-            .trimmingCharacters(in: .whitespaces)
-          if self.sessionId != parsedSid {
-            self.sessionId = parsedSid
-            self.log("[SID] Updated to Session ID: \(parsedSid)")
-            WebSocketManager.shared.sendJson(["type": "active_session_changed", "session_id": parsedSid])
-          }
-        } else if errStr.lowercased().contains("session") && (errStr.lowercased().contains("not found") || errStr.lowercased().contains("invalid") || errStr.lowercased().contains("expired")) {
-          self.sessionId = nil
-          self.log("[SID] Session invalid or not found, cleared local session ID")
-        }
-
-        self.streamingQueue.async {
-          var output = self.streamResponseText
-          output = output.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
-          output = output.trimmingCharacters(in: .whitespacesAndNewlines)
-          self.log("[Resp] \(output.prefix(80))")
-          DispatchQueue.main.async { cb(output) }
-        }
-      } catch {
-        self.currentAskProcess = nil
-        pty.master.readabilityHandler = nil
-        self.log("[Ask Err] \(error.localizedDescription)")
-        DispatchQueue.main.async { cb("[错误]") }
       }
+      
+      DispatchQueue.main.async { NSApplication.shared.activate(ignoringOtherApps: true) }
+      
+      // Write the prompt to the interactive process
+      guard let pty = self.prewarmedPty else { return }
+      let finalPrompt = prompt
+      self.log("[Prompt] Sending to interactive PTY: \(finalPrompt.prefix(60))")
+      pty.master.write((finalPrompt + "\r").data(using: .utf8)!)
+      // DO NOT send Ctrl-D. We want it to stay alive for the next turn!
     }
   }
 
@@ -1210,26 +1215,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   func stopSpeakingAnimation() {
     speakingTimer?.invalidate()
     speakingTimer = nil
-    hudWindowController?.updateState(state: "idle", amplitude: 0.0, text: "已完成回复")
     
-    if isWaitingForDropCommand {
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-        self?.startListeningForDropCommand()
+    log("[Live Mode] Text ended. Auto-triggering continuous listening loop...")
+    
+    // Explicitly reset queue markers for the next session loop
+    self.expectedSentenceCount = nil
+    self.pendingAudioMap.removeAll()
+    self.playQueue.removeAll()
+    self.nextPlayIndex = 0
+    self.isPlayingQueue = false
+    
+    DispatchQueue.main.async { [weak self] in
+      guard let s = self else { return }
+      s.statusBar.setStatus(.listening)
+      s.hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "我在听，你说吧...")
+      
+      s.voiceManager.amplitudeUpdateHandler = { [weak self] amp in
+        self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "我在听，你说吧...")
       }
-      return
-    }
-    
-    pendingHideWorkItem?.cancel()
-    let workItem = DispatchWorkItem { [weak self] in
-      guard let self = self else { return }
-      if self.voiceManager.isListening == false && self.speakingTimer == nil {
-        self.hudWindowController?.hideHUD { [weak self] in
-          self?.resumeSystemMedia()
+
+      s.voiceManager.startListening { [weak self] text in
+        guard let s = self else { return }
+        
+        let cleaned = text?.trimmingCharacters(in: .whitespacesAndNewlines)
+          .replacingOccurrences(of: "。", with: "")
+          .replacingOccurrences(of: "？", with: "")
+          .replacingOccurrences(of: "，", with: "") ?? ""
+        
+        guard !cleaned.isEmpty && cleaned.count > 1 else {
+          s.log("[Live Mode] Ignored empty/noise text segment, looping listen...")
+          s.stopSpeakingAnimation()
+          return
         }
+        
+        s.log("[Live Mode] Captured next voice command: '\(cleaned)'")
+        s.statusBar.setStatus(.sending)
+        s.hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "Thinking...")
+        s.processVoice(cleaned)
       }
     }
-    self.pendingHideWorkItem = workItem
-    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: workItem)
   }
 
   private func ensurePythonScripts() {

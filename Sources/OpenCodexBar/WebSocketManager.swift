@@ -10,6 +10,7 @@ class WebSocketManager: NSObject {
   var onTranscriptionFinal: ((String) -> Void)?
   var onActivateSession: ((String) -> Void)?
   var onStopRecording: ((String) -> Void)?
+  var onSettingsUpdated: (() -> Void)?
 
   private let queue = DispatchQueue(label: "com.opencodex.ws")
 
@@ -74,6 +75,8 @@ class WebSocketManager: NSObject {
       if let sid = json["session_id"] as? String {
         onActivateSession?(sid)
       }
+    case "settings_updated":
+      onSettingsUpdated?()
     default:
       break
     }

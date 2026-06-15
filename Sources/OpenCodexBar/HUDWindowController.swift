@@ -10,11 +10,20 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
   var webView: WKWebView!
   private var hudSessionId = 0
 
-  convenience init() {
-    let width: CGFloat = 360
-    let height: CGFloat = 180
+  private static func getMenuBarHeight() -> CGFloat {
+    guard let screen = NSScreen.screens.first else { return 24 }
+    let screenFrame = screen.frame
+    let visibleFrame = screen.visibleFrame
+    let height = (screenFrame.origin.y + screenFrame.height) - (visibleFrame.origin.y + visibleFrame.height)
+    // Avoid abnormal values, return 24 for standard non-notch screens
+    return (height >= 24 && height <= 60) ? height : 24
+  }
 
-    let screen = NSScreen.main ?? NSScreen.screens.first
+  convenience init() {
+    let width: CGFloat = 560
+    let height = HUDWindowController.getMenuBarHeight()
+
+    let screen = NSScreen.screens.first ?? NSScreen.main
     let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
     let x = screenFrame.origin.x + (screenFrame.width - width) / 2
     let y = screenFrame.origin.y + screenFrame.height - height
@@ -69,25 +78,139 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
 
     window?.contentView = webView
     loadVisualizer()
+    startMenuBarMonitoring()
+  }
+
+  private var menuBarTimer: Timer?
+  private var isCompactMode = false
+  private var lastActiveRegularApp: NSRunningApplication?
+
+  func startMenuBarMonitoring() {
+    if let frontApp = NSWorkspace.shared.frontmostApplication, frontApp.activationPolicy == .regular {
+      lastActiveRegularApp = frontApp
+    }
+    
+    NSWorkspace.shared.notificationCenter.addObserver(
+      self,
+      selector: #selector(handleAppActivation(_:)),
+      name: NSWorkspace.didActivateApplicationNotification,
+      object: nil
+    )
+
+    menuBarTimer?.invalidate()
+    menuBarTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+      self?.checkMenuBarWidth()
+    }
+  }
+
+  @objc private func handleAppActivation(_ notification: Notification) {
+    if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+      if app.activationPolicy == .regular {
+        lastActiveRegularApp = app
+      }
+    }
+  }
+
+  private func checkMenuBarWidth() {
+    guard let activeApp = lastActiveRegularApp else { return }
+    let appElement = AXUIElementCreateApplication(activeApp.processIdentifier)
+    
+    var menuBarVal: AnyObject?
+    let result = AXUIElementCopyAttributeValue(appElement, kAXMenuBarAttribute as CFString, &menuBarVal)
+    
+    var maxRightX: CGFloat = 0
+    
+    if result == .success, let menuBar = menuBarVal {
+      var childrenVal: AnyObject?
+      let childrenResult = AXUIElementCopyAttributeValue(menuBar as! AXUIElement, kAXChildrenAttribute as CFString, &childrenVal)
+      
+      if childrenResult == .success, let children = childrenVal as? [AXUIElement] {
+        for child in children {
+          var positionVal: AnyObject?
+          var sizeVal: AnyObject?
+          
+          AXUIElementCopyAttributeValue(child, kAXPositionAttribute as CFString, &positionVal)
+          AXUIElementCopyAttributeValue(child, kAXSizeAttribute as CFString, &sizeVal)
+          
+          if let posRef = positionVal, let sizeRef = sizeVal {
+            var position = CGPoint.zero
+            var size = CGSize.zero
+            AXValueGetValue(posRef as! AXValue, .cgPoint, &position)
+            AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+            
+            let rightX = position.x + size.width
+            if rightX > maxRightX {
+              maxRightX = rightX
+            }
+          }
+        }
+      }
+    }
+    
+    guard let window = self.window else { return }
+    // Normal extended left wing X coordinate is around window.x + 110.
+    let hudLeftBoundary = window.frame.origin.x + 180 - 70
+    
+    // If the menu bar extends past (hudLeftBoundary - 15), trigger compact mode.
+    let shouldBeCompact = maxRightX > (hudLeftBoundary - 15)
+    
+    AppDelegate.shared?.log("[AX Debug] maxRightX=\(maxRightX), hudLeftBoundary=\(hudLeftBoundary), shouldBeCompact=\(shouldBeCompact), isCompactMode=\(isCompactMode)")
+    
+    if shouldBeCompact != isCompactMode {
+      isCompactMode = shouldBeCompact
+      updateCompactMode(isCompact: isCompactMode)
+    }
+  }
+
+  private func updateCompactMode(isCompact: Bool) {
+    let js = """
+    (function() {
+      if (window.updateCompactMode) {
+        window.updateCompactMode(\(isCompact));
+        return "compactMode updated: " + \(isCompact);
+      }
+      return "window.updateCompactMode not found";
+    })()
+    """
+    let strongSelf = self
+    DispatchQueue.main.async {
+      strongSelf.webView.evaluateJavaScript(js) { (result, error) in
+        if let err = error {
+          AppDelegate.shared?.log("[AX JS Err] \(err.localizedDescription)")
+        } else if let res = result as? String {
+          AppDelegate.shared?.log("[AX JS Result] \(res)")
+          if res == "window.updateCompactMode not found" {
+            strongSelf.isCompactMode = false
+          }
+        }
+      }
+    }
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    AppDelegate.shared?.log("[AX] WebView didFinish. Re-syncing isCompactMode: \(isCompactMode)")
+    updateCompactMode(isCompact: isCompactMode)
   }
 
   func loadVisualizer() {
     let t = Int(Date().timeIntervalSince1970)
-    guard let url = URL(string: "http://127.0.0.1:8765/visualizer?mode=hud&t=\(t)") else { return }
+    let h = Int(HUDWindowController.getMenuBarHeight())
+    guard let url = URL(string: "http://127.0.0.1:8765/visualizer?mode=hud&t=\(t)&h=\(h)") else { return }
     
     let dataStore = WKWebsiteDataStore.default()
     dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: Date(timeIntervalSince1970: 0)) { [weak self] in
       guard let self = self else { return }
-      self.webView.load(URLRequest(url: url))
+      var request = URLRequest(url: url)
+      request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+      self.webView.load(request)
     }
   }
 
   func showHUD() {
-    loadVisualizer()
     guard let window = self.window else { return }
     hudSessionId += 1
 
-    let screen = NSScreen.main ?? NSScreen.screens.first
+    let screen = NSScreen.screens.first ?? NSScreen.main
     let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
     let height = window.frame.height
     
@@ -98,27 +221,20 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
       height: height
     )
     
-    if !window.isVisible || window.alphaValue == 0.0 {
-      var startFrame = finalFrame
-      startFrame.origin.y = screenFrame.origin.y + screenFrame.height
-      window.setFrame(startFrame, display: true)
-      window.alphaValue = 0.0
-    }
-    
+    window.setFrame(finalFrame, display: true)
+    window.alphaValue = 1.0
     window.invalidateShadow()
     window.orderFrontRegardless()
-
-    NSAnimationContext.runAnimationGroup({ context in
-      context.duration = 0.35
-      context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-      window.animator().alphaValue = 1.0
-      window.animator().setFrame(finalFrame, display: true)
-    }) {
-      window.invalidateShadow()
-    }
   }
 
-  func hideHUD(completion: (() -> Void)? = nil) {
+  func hideHUD(force: Bool = false, completion: (() -> Void)? = nil) {
+    updateState(state: "idle", amplitude: 0.0, text: "")
+    
+    if !force {
+      completion?()
+      return
+    }
+    
     guard let window = self.window, window.isVisible else {
       completion?()
       return
@@ -126,22 +242,13 @@ class HUDWindowController: NSWindowController, WKNavigationDelegate {
     hudSessionId += 1
     let currentSession = hudSessionId
 
-    let screen = NSScreen.main ?? NSScreen.screens.first
-    let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-    
-    let currentFrame = window.frame
-    var targetFrame = currentFrame
-    targetFrame.origin.y = screenFrame.origin.y + screenFrame.height
-
     NSAnimationContext.runAnimationGroup({ context in
-      context.duration = 0.3
+      context.duration = 0.18
       context.timingFunction = CAMediaTimingFunction(name: .easeIn)
       window.animator().alphaValue = 0.0
-      window.animator().setFrame(targetFrame, display: true)
     }) { [weak self] in
       guard let self = self, self.hudSessionId == currentSession else { return }
       window.orderOut(nil)
-      window.setFrame(currentFrame, display: false)
       completion?()
     }
   }

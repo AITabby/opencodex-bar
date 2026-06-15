@@ -20,6 +20,7 @@ struct VoiceSettings: Decodable {
   var active_session_id: String?
   var voice_system_prompt: String?
   var tts_resource: String?
+  var interaction_mode: String?
 
   static func load() -> VoiceSettings {
     let home = NSHomeDirectory()
@@ -81,7 +82,7 @@ class VoiceManager: NSObject {
 
     let settings = VoiceSettings.load()
     vadThreshold = settings.vad_threshold ?? -35.0
-    vadDuration = 3.5 // Fallback safety timer, let proxy Semantic VAD do the quick cutoff
+    vadDuration = 1.5 // Fallback safety timer, lower latency
     AppDelegate.shared?.log("[VM] VAD threshold=\(vadThreshold)dB fallback duration=\(vadDuration)s")
 
     let inputNode = audioEngine.inputNode
@@ -139,6 +140,14 @@ class VoiceManager: NSObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         self.completionHandler?(trimmed.isEmpty ? nil : trimmed)
         self.completionHandler = nil
+      }
+    }
+
+    WebSocketManager.shared.onTranscriptionPartial = { text in
+      DispatchQueue.main.async {
+        if let ad = AppDelegate.shared, let hud = ad.hudWindowController {
+          hud.updateState(state: "listening", amplitude: 0.0, text: text)
+        }
       }
     }
 
@@ -216,7 +225,8 @@ class VoiceManager: NSObject {
     do {
       try audioEngine.start()
       WebSocketManager.shared.sendStartSTT()
-      AppDelegate.shared?.log("[VM] Engine started, STT streaming")
+      DispatchQueue.main.async { AppDelegate.shared?.prewarmCodexProcess() }
+      AppDelegate.shared?.log("[VM] Engine started, STT streaming, prewarming Codex")
     } catch {
       AppDelegate.shared?.log("[VM Err] Engine start: \(error.localizedDescription)")
       completion(nil)
