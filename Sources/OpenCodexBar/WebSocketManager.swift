@@ -11,6 +11,8 @@ class WebSocketManager: NSObject {
   var onActivateSession: ((String) -> Void)?
   var onStopRecording: ((String) -> Void)?
   var onSettingsUpdated: (() -> Void)?
+  var onModelChunk: ((String) -> Void)?
+  var onModelDone: ((String) -> Void)?
 
   private let queue = DispatchQueue(label: "com.opencodex.ws")
 
@@ -77,6 +79,14 @@ class WebSocketManager: NSObject {
       }
     case "settings_updated":
       onSettingsUpdated?()
+    case "model_chunk":
+      if let t = json["text"] as? String {
+        onModelChunk?(t)
+      }
+    case "model_done":
+      if let t = json["text"] as? String {
+        onModelDone?(t)
+      }
     default:
       break
     }

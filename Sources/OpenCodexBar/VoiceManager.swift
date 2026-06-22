@@ -100,7 +100,7 @@ class VoiceManager: NSObject {
     lowVolumeDuration = 0.0
     hasSpeechStarted = false
     isActive = true
-
+    inputNode.removeTap(onBus: 0)
     inputNode.installTap(onBus: 0, bufferSize: 3200, format: hwFormat) { [weak self] buffer, _ in
       guard let self = self, self.isActive else { return }
       let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
@@ -125,7 +125,7 @@ class VoiceManager: NSObject {
         }
         let rms = sqrt(sumSq / Double(count))
         var power: Float = 20.0 * log10(Float(max(rms, 0.0001)))
-        if let ad = AppDelegate.shared, ad.currentPlayProcess != nil {
+        if let ad = AppDelegate.shared, (ad.currentPlayProcess != nil || ad.isPlayingQueue) {
           power = -100.0
         }
         currentPower = power
@@ -175,14 +175,7 @@ class VoiceManager: NSObject {
     vadTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
       guard let self = self, self.isActive, !self.isStopping else { return }
       tickCount += 1
-      let power = self.currentPower
-
-      if tickCount < 4 {
-        self.hasSpeechStarted = false
-        self.lowVolumeDuration = 0.0
-        return
-      }
-
+      
       if !self.hasSpeechStarted {
         self.noSpeechDuration += 0.1
         if self.noSpeechDuration >= 4.0 && self.onNoSpeechTimeout != nil {
@@ -192,24 +185,6 @@ class VoiceManager: NSObject {
           handler?()
           return
         }
-      }
-
-      if power >= self.vadThreshold {
-        if !self.hasSpeechStarted {
-          AppDelegate.shared?.log("[VAD] Speech started")
-        }
-        self.hasSpeechStarted = true
-        self.lowVolumeDuration = 0.0
-        self.noSpeechDuration = 0.0
-      } else {
-        if self.hasSpeechStarted {
-          self.lowVolumeDuration += 0.1
-        }
-      }
-
-      if self.lowVolumeDuration >= self.vadDuration {
-        AppDelegate.shared?.log("[VAD] Silence \(self.vadDuration)s → stopping")
-        self.stopListening()
       }
     }
 

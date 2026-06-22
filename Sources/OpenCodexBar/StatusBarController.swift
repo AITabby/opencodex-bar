@@ -13,7 +13,7 @@ class StatusBarController {
   private let statusItem: NSStatusItem
   private let popover: NSPopover
   private let apiClient: APIClient
-  private var currentStatus: AppStatus = .idle
+  private(set) var currentStatus: AppStatus = .idle
   private var animationTimer: Timer?
   private var frameIndex = 0
 
