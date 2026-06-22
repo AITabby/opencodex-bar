@@ -46,11 +46,18 @@ class VoiceManager: NSObject {
   private var noSpeechDuration: TimeInterval = 0.0
 
   var onNoSpeechTimeout: (() -> Void)?
+  var onUserInterrupted: (() -> Void)?
 
   private var vadTimer: Timer?
   private var meteringTimer: Timer?
 
   var amplitudeUpdateHandler: ((Float) -> Void)?
+
+  var isInterruptionMonitoring = false
+  private var interruptionThreshold: Float = -35.0
+  private var consecutiveInterruptionFrames = 0
+  private var monitoringStartTime: Date?
+  private var maxPlaybackPower: Float = -100.0
 
   var isListening: Bool {
     return isActive
@@ -255,5 +262,96 @@ class VoiceManager: NSObject {
     audioEngine.stop()
     WebSocketManager.shared.onTranscriptionFinal = nil
     WebSocketManager.shared.onStopRecording = nil
+  }
+
+  func startInterruptionMonitoring() {
+    guard !isActive else { return }
+    AppDelegate.shared?.log("[VM] startInterruptionMonitoring")
+    
+    let settings = VoiceSettings.load()
+    let baseThreshold = settings.vad_threshold ?? -35.0
+    // Set a stable interruption threshold (+12dB above base threshold, capped at -22dB)
+    // to filter out normal speaker feedback while allowing intentional human speech to interrupt.
+    interruptionThreshold = min(-22.0, baseThreshold + 12.0)
+    
+    isInterruptionMonitoring = true
+    consecutiveInterruptionFrames = 0
+    monitoringStartTime = Date()
+    
+    let inputNode = audioEngine.inputNode
+    let hwFormat = inputNode.outputFormat(forBus: 0)
+    let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)!
+    guard let converter = AVAudioConverter(from: hwFormat, to: targetFormat) else {
+      AppDelegate.shared?.log("[VM Err] Cannot create converter for interruption")
+      return
+    }
+    converter.channelMap = [0]
+    
+    inputNode.removeTap(onBus: 0)
+    inputNode.installTap(onBus: 0, bufferSize: 3200, format: hwFormat) { [weak self] buffer, _ in
+      guard let self = self, self.isInterruptionMonitoring else { return }
+      
+      let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+        outStatus.pointee = .haveData
+        return buffer
+      }
+      let fc = AVAudioFrameCount(Double(buffer.frameLength) * 16000.0 / hwFormat.sampleRate)
+      guard let outBuf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: fc) else { return }
+      var err: NSError?
+      let status = converter.convert(to: outBuf, error: &err, withInputFrom: inputBlock)
+      guard status == .haveData, let ch = outBuf.int16ChannelData else { return }
+      
+      let count = Int(outBuf.frameLength)
+      if count > 0 {
+        var sumSq: Double = 0
+        for i in 0..<count {
+          let s = Double(ch[0][i]) / Double(Int16.max)
+          sumSq += s * s
+        }
+        let rms = sqrt(sumSq / Double(count))
+        let power: Float = 20.0 * log10(Float(max(rms, 0.0001)))
+        self.currentPower = power
+        
+        // Use a simple, responsive interruption detection logic (2 consecutive frames, ~140ms)
+        if power > self.interruptionThreshold {
+          self.consecutiveInterruptionFrames += 1
+          if self.consecutiveInterruptionFrames >= 2 {
+            AppDelegate.shared?.log("[VM] Interruption detected (power=\(power)dB, threshold=\(self.interruptionThreshold)dB)")
+            self.consecutiveInterruptionFrames = 0
+            DispatchQueue.main.async {
+              self.onUserInterrupted?()
+            }
+          }
+        } else {
+          self.consecutiveInterruptionFrames = 0
+        }
+      }
+    }
+    
+    meteringTimer?.invalidate()
+    meteringTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
+      guard let self = self, self.isInterruptionMonitoring else { return }
+      let p = self.currentPower
+      let clamped = max(-60.0, min(-10.0, p))
+      let amp = (clamped + 60.0) / 50.0
+      self.amplitudeUpdateHandler?(amp)
+    }
+    
+    do {
+      try audioEngine.start()
+      AppDelegate.shared?.log("[VM] Interruption monitoring engine started successfully.")
+    } catch {
+      AppDelegate.shared?.log("[VM Err] Interruption monitoring engine start failed: \(error.localizedDescription)")
+    }
+  }
+
+  func stopInterruptionMonitoring() {
+    AppDelegate.shared?.log("[VM] stopInterruptionMonitoring")
+    isInterruptionMonitoring = false
+    consecutiveInterruptionFrames = 0
+    meteringTimer?.invalidate()
+    meteringTimer = nil
+    audioEngine.inputNode.removeTap(onBus: 0)
+    audioEngine.stop()
   }
 }

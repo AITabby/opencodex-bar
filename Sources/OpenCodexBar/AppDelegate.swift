@@ -88,6 +88,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     voiceManager = VoiceManager()
+    voiceManager.onUserInterrupted = { [weak self] in
+      self?.handleUserInterruption()
+    }
     hudWindowController = HUDWindowController()
     WebSocketManager.shared.connect()
     
@@ -99,8 +102,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     WebSocketManager.shared.onActivateSession = { [weak self] sid in
       self?.log("[VM] Activate session: \(sid)")
       DispatchQueue.main.async {
-        self?.sessionId = sid
-        self?.hudWindowController?.updateState(state: "idle", amplitude: 0, text: "已切换到会话: \(sid.prefix(8))...")
+        guard let s = self else { return }
+        s.sessionId = sid
+        s.hudWindowController?.updateState(state: "idle", amplitude: 0, text: "已切换到会话: \(sid.prefix(8))...")
+        
+        // Invalidate any previous query sequence and reset stream states
+        s.currentQuerySequence += 1
+        s.streamResponseText = ""
+        s.streamCurrentSentence = ""
+        s.hasHitCodexResponsePrefix = false
+        s.didPlayResponseChime = false
+        s.didSynthesizeAnySpeech = false
+        s.nextSentenceIndex = 0
+        s.nextPlayIndex = 0
+        s.pendingAudioMap.removeAll()
+        s.expectedSentenceCount = nil
+        s.streamProcessedCharCount = 0
+        s.queryExecutedAnyTools = false
+        s.streamInCodeBlock = false
       }
     }
     
@@ -281,6 +300,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       currentPlayProcess = nil
     }
     voiceManager?.cancelListening()
+    voiceManager?.stopInterruptionMonitoring()
     speakingTimer?.invalidate()
     speakingTimer = nil
     
@@ -304,6 +324,70 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     nextPlayIndex = 0
     pendingAudioMap.removeAll()
     expectedSentenceCount = nil
+    
+    // Resume system media when canceling active voice operations
+    resumeSystemMedia()
+  }
+
+  func handleUserInterruption() {
+    log("[Interruption] User speech detected. Instantly transitioning to listening.")
+    
+    // 1. Stop active afplay process
+    if let existingPlay = currentPlayProcess {
+      if existingPlay.isRunning {
+        existingPlay.terminate()
+        log("[Voice] Terminated active afplay playback due to interruption")
+      }
+      currentPlayProcess = nil
+    }
+    
+    // 2. Clear playing and TTS queues
+    speakingTimer?.invalidate()
+    speakingTimer = nil
+    pendingHideWorkItem?.cancel()
+    pendingHideWorkItem = nil
+    mediaMonitoringTimer?.invalidate()
+    mediaMonitoringTimer = nil
+    ttsQueue.removeAll()
+    ttsQueueIndex = 0
+    preFetchedAudioData = nil
+    preFetchedIndex = -1
+    playQueue.removeAll()
+    isPlayingQueue = false
+    nextSentenceIndex = 0
+    nextPlayIndex = 0
+    pendingAudioMap.removeAll()
+    expectedSentenceCount = nil
+    
+    // 3. Stop interruption monitoring
+    voiceManager.stopInterruptionMonitoring()
+    
+    // 4. Start active listening after a short 150ms delay to let AVAudioEngine reset
+    statusBar.setStatus(.listening)
+    hudWindowController?.showHUD()
+    hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "正在倾听...")
+    pauseSystemMedia()
+    
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+      guard let self = self else { return }
+      
+      self.voiceManager.amplitudeUpdateHandler = { [weak self] amp in
+        self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "正在倾听...")
+      }
+      
+      self.voiceManager.startListening { [weak self] text in
+        guard let s = self else { return }
+        s.log("[STT] '\(text ?? "nil")'")
+        guard let t = text else {
+          s.statusBar.setStatus(.idle)
+          s.hudWindowController?.hideHUD(force: true) { [weak s] in
+            s?.resumeSystemMedia()
+          }
+          return
+        }
+        s.processVoice(t)
+      }
+    }
   }
 
   @objc func toggleVoiceInput() {
@@ -314,7 +398,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     lastToggleTime = now
 
-    let isActive = voiceManager.isListening || currentAskProcess != nil || currentPlayProcess != nil || isPlayingQueue
+    let isActive = (statusBar.currentStatus != .idle) || (currentPlayProcess != nil) || isPlayingQueue
     
     if isActive {
       log("[Toggle] Active -> Stop (Standby)")
@@ -840,6 +924,9 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
     let chunkFile = "/tmp/ocb_tts_chunk_\(playChunkIndex).\(ext)"
     playChunkIndex += 1
     
+    // Start interruption monitoring when TTS audio starts playing!
+    voiceManager.startInterruptionMonitoring()
+    
     do {
       try data.write(to: URL(fileURLWithPath: chunkFile))
       
@@ -870,6 +957,7 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
           self?.streamingQueue.async {
             guard let s = self, s.currentQuerySequence == activeSeq else { return }
             s.currentPlayProcess = nil
+            s.voiceManager.stopInterruptionMonitoring()
             s.isPlayingQueue = false
             s.processPlayQueue()
           }
@@ -1057,6 +1145,7 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
       
       DispatchQueue.main.async { [weak self] in
         guard let s = self, s.currentQuerySequence == activeSeq else { return }
+        s.voiceManager.startInterruptionMonitoring()
         s.statusBar.setStatus(.idle)
         s.startSpeakingAnimation(text: text)
       }
@@ -1076,6 +1165,7 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
         
         s.log("[TTS] Finished playing full audio")
         try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+        s.voiceManager.stopInterruptionMonitoring()
         
         DispatchQueue.main.async {
           guard s.currentQuerySequence == activeSeq else { return }
@@ -1274,6 +1364,7 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
         
         s.voiceManager.startListening { [weak self] text in
           guard let s = self else { return }
+          guard s.statusBar.currentStatus != .idle else { return }
           
           let cleaned = text?.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "。", with: "")
@@ -1522,6 +1613,10 @@ if __name__ == "__main__":
                             lowerPath.contains("quicktime") ||
                             lowerPath.contains("neteasemusic") ||
                             lowerPath.contains("qqmusic") ||
+                            lowerPath.contains("music") ||
+                            lowerPath.contains("spotify") ||
+                            lowerPath.contains("safari") ||
+                            lowerPath.contains("chrome") ||
                             lowerPath.contains("tencentvideo") ||
                             lowerPath.contains("youku") ||
                             lowerPath.contains("iqiyi") ||
@@ -1563,6 +1658,11 @@ if __name__ == "__main__":
   private func pauseSystemMedia() {
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
+      
+      if self.didPauseMediaViaMediaRemote || !self.pausedMediaApps.isEmpty {
+        self.log("[Media] Media is already paused by us. Preserving original resume state.")
+        return
+      }
       
       let playingPids = self.getAudioPlayingPIDs()
       let ourPid = Int(getpid())
