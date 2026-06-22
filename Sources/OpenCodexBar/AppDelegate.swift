@@ -46,6 +46,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private var streamProcessedCharCount = 0
   private var streamInCodeBlock = false
   private var proxyProcess: Process?
+  private var lastToggleTime = Date.distantPast
 
   func log(_ m: String) {
     if let h = FileHandle(forWritingAtPath: logFile) {
@@ -306,6 +307,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc func toggleVoiceInput() {
+    let now = Date()
+    if now.timeIntervalSince(lastToggleTime) < 0.4 {
+      log("[Toggle] Throttled rapid keypress/auto-repeat")
+      return
+    }
+    lastToggleTime = now
+
     let isActive = voiceManager.isListening || currentAskProcess != nil || currentPlayProcess != nil || isPlayingQueue
     
     if isActive {
