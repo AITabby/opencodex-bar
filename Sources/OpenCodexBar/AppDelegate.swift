@@ -126,12 +126,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Register streaming text listeners for TTS
     WebSocketManager.shared.onModelChunk = { [weak self] text in
       guard let self = self else { return }
+      guard self.statusBar.currentStatus != .idle else { return }
       self.log("[WS Chunk] \(text)")
       self.processStreamingChunk(text, querySeq: self.currentQuerySequence)
     }
     
     WebSocketManager.shared.onModelDone = { [weak self] text in
       guard let self = self else { return }
+      guard self.statusBar.currentStatus != .idle else { return }
       self.log("[WS Done] \(text)")
       self.streamingQueue.async {
         // Flush remaining text
