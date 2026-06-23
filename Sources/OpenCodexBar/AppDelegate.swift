@@ -1658,6 +1658,12 @@ if __name__ == "__main__":
   }
 
   private func pauseSystemMedia() {
+    let settings = VoiceSettings.load()
+    if settings.pause_media_on_listen == false {
+      log("[Media] pause_media_on_listen is false. Skipping media pause.")
+      return
+    }
+
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
       

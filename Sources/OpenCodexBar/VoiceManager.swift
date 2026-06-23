@@ -21,6 +21,7 @@ struct VoiceSettings: Decodable {
   var voice_system_prompt: String?
   var tts_resource: String?
   var interaction_mode: String?
+  var pause_media_on_listen: Bool?
 
   static func load() -> VoiceSettings {
     let home = NSHomeDirectory()
