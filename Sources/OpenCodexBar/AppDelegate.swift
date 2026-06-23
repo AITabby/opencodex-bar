@@ -929,8 +929,22 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
     // Start interruption monitoring when TTS audio starts playing!
     voiceManager.startInterruptionMonitoring()
     
+    let rawFile = "/tmp/ocb_tts_chunk_\(playChunkIndex)_raw.\(ext)"
     do {
-      try data.write(to: URL(fileURLWithPath: chunkFile))
+      try data.write(to: URL(fileURLWithPath: rawFile))
+      let settings = VoiceSettings.load()
+      let volumeVal = settings.tts_volume ?? 1.5
+      if volumeVal != 1.0 {
+        let success = amplifyAudioFile(inputPath: rawFile, outputPath: chunkFile, volume: volumeVal)
+        if !success {
+          try? FileManager.default.removeItem(atPath: chunkFile)
+          try? FileManager.default.copyItem(atPath: rawFile, toPath: chunkFile)
+        }
+      } else {
+        try? FileManager.default.removeItem(atPath: chunkFile)
+        try? FileManager.default.copyItem(atPath: rawFile, toPath: chunkFile)
+      }
+      try? FileManager.default.removeItem(atPath: rawFile)
       
       // Update speaking status for VAD sync
       try? "speaking".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
@@ -953,7 +967,9 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
         let p = Process()
         s.currentPlayProcess = p
         p.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
-        p.arguments = [chunkFile]
+        let settings = VoiceSettings.load()
+        let volumeVal = settings.tts_volume ?? 1.5
+        p.arguments = ["-v", String(volumeVal), chunkFile]
         p.terminationHandler = { [weak self] _ in
           try? FileManager.default.removeItem(atPath: chunkFile)
           self?.streamingQueue.async {
@@ -1138,9 +1154,24 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
   private func playFullAudio(_ data: Data, text: String) {
     let activeSeq = self.currentQuerySequence
     let isWav = data.count >= 4 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 // "RIFF"
-    let audioUrl = isWav ? "/tmp/ocb_tts.wav" : "/tmp/ocb_tts.mp3"
+    let ext = isWav ? "wav" : "mp3"
+    let rawUrl = "/tmp/ocb_tts_raw.\(ext)"
+    let audioUrl = "/tmp/ocb_tts.\(ext)"
     do {
-      try data.write(to: URL(fileURLWithPath: audioUrl))
+      try data.write(to: URL(fileURLWithPath: rawUrl))
+      let settings = VoiceSettings.load()
+      let volumeVal = settings.tts_volume ?? 1.5
+      if volumeVal != 1.0 {
+        let success = amplifyAudioFile(inputPath: rawUrl, outputPath: audioUrl, volume: volumeVal)
+        if !success {
+          try? FileManager.default.removeItem(atPath: audioUrl)
+          try? FileManager.default.copyItem(atPath: rawUrl, toPath: audioUrl)
+        }
+      } else {
+        try? FileManager.default.removeItem(atPath: audioUrl)
+        try? FileManager.default.copyItem(atPath: rawUrl, toPath: audioUrl)
+      }
+      try? FileManager.default.removeItem(atPath: rawUrl)
       
       // Update speaking status for VAD sync
       try? "speaking".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
@@ -1161,7 +1192,9 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
         let playTask = Process()
         s.currentPlayProcess = playTask
         playTask.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
-        playTask.arguments = [audioUrl]
+        let settings = VoiceSettings.load()
+        let volumeVal = settings.tts_volume ?? 1.5
+        playTask.arguments = ["-v", String(volumeVal), audioUrl]
         try? playTask.run()
         playTask.waitUntilExit()
         
@@ -1978,6 +2011,36 @@ if __name__ == "__main__":
     
     let prompt = "我往你的刘海拖入了一个文件，该文件已保存在本地路径：\(filePath) (原文件名: \(fileName))。关于这个文件，我的指令是：\"\(command)\"。请读取文件内容并执行该指令，然后直接用语音简要回答我。"
     processVoice(prompt)
+  }
+
+  private func amplifyAudioFile(inputPath: String, outputPath: String, volume: Float) -> Bool {
+    let task = Process()
+    let ffmpegCandidates = [
+      "/opt/homebrew/bin/ffmpeg",
+      "/usr/local/bin/ffmpeg",
+      "/usr/bin/ffmpeg"
+    ]
+    var ffmpegPath = "ffmpeg"
+    for candidate in ffmpegCandidates {
+      if FileManager.default.fileExists(atPath: candidate) {
+        ffmpegPath = candidate
+        break
+      }
+    }
+    
+    task.executableURL = URL(fileURLWithPath: ffmpegPath)
+    task.arguments = ["-y", "-i", inputPath, "-filter:a", "volume=\(volume)", outputPath]
+    task.standardOutput = Pipe()
+    task.standardError = Pipe()
+    
+    do {
+      try task.run()
+      task.waitUntilExit()
+      return task.terminationStatus == 0
+    } catch {
+      log("[Amplify Err] Failed to run ffmpeg: \(error.localizedDescription)")
+      return false
+    }
   }
 
   private func cancelWaitingForDropCommand() {

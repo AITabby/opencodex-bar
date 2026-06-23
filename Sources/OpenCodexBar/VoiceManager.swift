@@ -22,6 +22,7 @@ struct VoiceSettings: Decodable {
   var tts_resource: String?
   var interaction_mode: String?
   var pause_media_on_listen: Bool?
+  var tts_volume: Float?
 
   static func load() -> VoiceSettings {
     let home = NSHomeDirectory()
@@ -153,7 +154,7 @@ class VoiceManager: NSObject {
 
     WebSocketManager.shared.onTranscriptionPartial = { text in
       DispatchQueue.main.async {
-        if let ad = AppDelegate.shared, let hud = ad.hudWindowController {
+        if let ad = AppDelegate.shared, ad.statusBar.currentStatus == .listening, let hud = ad.hudWindowController {
           hud.updateState(state: "listening", amplitude: 0.0, text: text)
         }
       }
@@ -163,10 +164,11 @@ class VoiceManager: NSObject {
       AppDelegate.shared?.log("[VM] Server requested stop recording early for text: '\(text.prefix(50))'")
       DispatchQueue.main.async {
         guard let self = self, self.isActive else { return }
-        // Update HUD to show thinking/loading state instantly
+        // Update HUD and status bar to show thinking/loading state instantly
+        AppDelegate.shared?.statusBar.setStatus(.sending)
         AppDelegate.shared?.hudWindowController?.updateState(state: "thinking", amplitude: 0, text: text)
-        // Locally stop engine without triggering duplicate stop_stt
-        self.stopEngine()
+        // Locally stop recording engine ONLY, keep WS callbacks active to receive transcription_final
+        self.stopAudioEngineOnly()
       }
     }
 
@@ -252,15 +254,19 @@ class VoiceManager: NSObject {
     }
   }
 
-  private func stopEngine() {
-    isActive = false
-    isStopping = false
+  private func stopAudioEngineOnly() {
     vadTimer?.invalidate()
     vadTimer = nil
     meteringTimer?.invalidate()
     meteringTimer = nil
     audioEngine.inputNode.removeTap(onBus: 0)
     audioEngine.stop()
+  }
+
+  private func stopEngine() {
+    isActive = false
+    isStopping = false
+    stopAudioEngineOnly()
     WebSocketManager.shared.onTranscriptionFinal = nil
     WebSocketManager.shared.onStopRecording = nil
   }
@@ -269,11 +275,27 @@ class VoiceManager: NSObject {
     guard !isActive else { return }
     AppDelegate.shared?.log("[VM] startInterruptionMonitoring")
     
+    // Clear amplitude update handler to avoid leaking listening state updates during speech playback
+    self.amplitudeUpdateHandler = nil
+    
     let settings = VoiceSettings.load()
     let baseThreshold = settings.vad_threshold ?? -35.0
-    // Set a stable interruption threshold (+12dB above base threshold, capped at -22dB)
-    // to filter out normal speaker feedback while allowing intentional human speech to interrupt.
-    interruptionThreshold = min(-22.0, baseThreshold + 12.0)
+    let ttsVolume = settings.tts_volume ?? 1.5
+    
+    // Calculate the digital gain increase in decibels from the volume multiplier
+    var volumeGainDb: Float = 0.0
+    if ttsVolume > 0.0 {
+      volumeGainDb = 20.0 * log10(ttsVolume)
+    }
+    
+    // Determine the threshold sensitivity based on whether music is allowed to play during voice activation
+    if settings.pause_media_on_listen == false {
+      // Background music is playing. We must use a higher, less sensitive threshold to prevent music from self-interrupting.
+      interruptionThreshold = min(-18.0 + volumeGainDb, baseThreshold + 12.0 + volumeGainDb)
+    } else {
+      // Quiet background (music is paused). We can use a highly sensitive threshold for quick and effortless interruption.
+      interruptionThreshold = min(-26.0 + volumeGainDb, baseThreshold + 5.0 + volumeGainDb)
+    }
     
     isInterruptionMonitoring = true
     consecutiveInterruptionFrames = 0
@@ -289,7 +311,7 @@ class VoiceManager: NSObject {
     converter.channelMap = [0]
     
     inputNode.removeTap(onBus: 0)
-    inputNode.installTap(onBus: 0, bufferSize: 3200, format: hwFormat) { [weak self] buffer, _ in
+    inputNode.installTap(onBus: 0, bufferSize: 1600, format: hwFormat) { [weak self] buffer, _ in
       guard let self = self, self.isInterruptionMonitoring else { return }
       
       let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
