@@ -291,10 +291,10 @@ class VoiceManager: NSObject {
     // Determine the threshold sensitivity based on whether music is allowed to play during voice activation
     if settings.pause_media_on_listen == false {
       // Background music is playing. We must use a higher, less sensitive threshold to prevent music from self-interrupting.
-      interruptionThreshold = min(-18.0 + volumeGainDb, baseThreshold + 12.0 + volumeGainDb)
+      interruptionThreshold = min(-10.0 + volumeGainDb, baseThreshold + 20.0 + volumeGainDb)
     } else {
-      // Quiet background (music is paused). We can use a highly sensitive threshold for quick and effortless interruption.
-      interruptionThreshold = min(-26.0 + volumeGainDb, baseThreshold + 5.0 + volumeGainDb)
+      // Quiet background (music is paused). We can use a higher threshold to prevent TTS voice from self-interrupting.
+      interruptionThreshold = min(-15.0 + volumeGainDb, baseThreshold + 15.0 + volumeGainDb)
     }
     
     isInterruptionMonitoring = true
